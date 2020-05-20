@@ -20,6 +20,7 @@ esac
 done
 
 docker run -v $(pwd)/habitat-challenge-data:/habitat-challenge-data \
+    -v $(pwd)/temp:/temp \
     --runtime=nvidia \
     -e "AGENT_EVALUATION_TYPE=local" \
     -e "TRACK_CONFIG_FILE=/challenge_pointnav2020.local.rgbd.yaml" \
