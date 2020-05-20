@@ -6,6 +6,9 @@ import os
 import cv2
 from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat.utils.visualizations import maps
+from myhabitatagent import DSLAMAgent
+
+from arguments import parse_args
 
 
 class RandomAgent(habitat.Agent):
@@ -58,25 +61,43 @@ class ShortestPathAgent(habitat.Agent):
         # return {"action": numpy.random.choice(self._POSSIBLE_ACTIONS)}
 
 
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--evaluation", type=str, required=True, choices=["local", "remote"])
-    args = parser.parse_args()
+    params = parse_args(default_files=('./habitat_submission.conf', ))
+    is_submission = (params.gibson_mode == 'submission')
+
+    if not is_submission:
+        os.environ["CHALLENGE_CONFIG_FILE"] = './configs/challenge_pointnav_supervised.yaml'
+
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--evaluation", type=str, required=True, choices=["local", "remote"])
+    # parser.add_argument("--config", type=str, default='', required=False)
+    # args = parser.parse_args()
+    #
+    # if args.config != '':
+    #     os.environ["CHALLENGE_CONFIG_FILE"] = args.config
 
     config_paths = os.environ["CHALLENGE_CONFIG_FILE"]
     config = habitat.get_config(config_paths)
 
+    grid_cell_size = 0.05  # 5cm
+    map_size = (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / grid_cell_size
+    assert config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION == int(map_size)
+
+    print ("Using config file(s): %s"%(str(config_paths)))
     # agent = RandomAgent(task_config=config)
 
-    if args.evaluation == "local":
+    if params.habitat_eval == "local":
         challenge = habitat.Challenge(eval_remote=False)
+        env = challenge._env
+        # agent = ShortestPathAgent(task_config=config, env=env)
+        agent = DSLAMAgent(task_config=config, params=params, env=env)
+        challenge.submit(agent, num_episodes=25)
+
     else:
         challenge = habitat.Challenge(eval_remote=True)
-
-    env = challenge._env
-    agent = ShortestPathAgent(task_config=config, env=env)
-
-    challenge.submit(agent)
+        agent = DSLAMAgent(task_config=config, params=params, env=None)
+        challenge.submit(agent)
 
 
 if __name__ == "__main__":
