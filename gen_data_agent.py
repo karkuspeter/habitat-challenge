@@ -268,9 +268,9 @@ def generate_maps():
 
 
 def generate_scenarios(output_filename=None, num_episodes=50000, skip_first_n=0,
-                       spin_every_forward_n=1000, spin_before_done=False, write_lock=None):
+                       spin_every_forward_n=1000, spin_before_done=False, mix_random_policy=False, split='val', episodes_per_scene=50, write_lock=None):
     # config = habitat.get_config(config_paths="configs/tasks/pointnav.yaml")
-    config = habitat.get_config("./configs/challenge_modified.yaml",)
+    config = habitat.get_config("./configs/challenge_datagen.yaml",)
 
     floors_for_scene = {}
 
@@ -280,6 +280,8 @@ def generate_scenarios(output_filename=None, num_episodes=50000, skip_first_n=0,
     map_size = (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / grid_cell_size
     config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION = int(map_size)
     config.TASK.SENSORS.append("HEADING_SENSOR")
+    config.DATASET.SPLIT = split
+    config.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_EPISODES = episodes_per_scene
     config.freeze()
 
     with SimpleRLEnv(config=config) as env:
@@ -325,6 +327,8 @@ def generate_scenarios(output_filename=None, num_episodes=50000, skip_first_n=0,
             spin_n_more = 0
             has_reached_goal = False
             spin_action = 2  # left
+            num_actions_this_policy = 0
+            random_policy_active = True
 
             other_dircetion = lambda a: (2 if a == 3 else 3)
 
@@ -339,11 +343,31 @@ def generate_scenarios(output_filename=None, num_episodes=50000, skip_first_n=0,
                     spin_action = other_dircetion(spin_action)  # flip direction
                     action = spin_action
                     spin_n_more = 11
+                elif mix_random_policy:
+                    if random_policy_active:
+                        action = int(np.random.choice([1, 2, 3], 1, p=[0.5, 0.25, 0.25]))
+
+                        num_actions_this_policy += 1
+                        if num_actions_this_policy > 40:
+                            num_actions_this_policy = 0
+                            random_policy_active = False
+                    else:
+                        # shortest path
+                        action = follower.get_next_action(
+                            env.habitat_env.current_episode.goals[0].position
+                        )
+
+                        num_actions_this_policy += 1
+                        if num_actions_this_policy > 30:
+                            num_actions_this_policy = 0
+                            random_policy_active = True
                 else:
                     # shortest path
                     action = follower.get_next_action(
                         env.habitat_env.current_episode.goals[0].position
                     )
+
+
                 # Overwrite at goal, choosing stop action for the first time
                 if spin_before_done and action == 0 and not has_reached_goal:
                     has_reached_goal = True
@@ -460,8 +484,6 @@ def generate_scenarios(output_filename=None, num_episodes=50000, skip_first_n=0,
                 # plt.show()
                 # import ipdb; ipdb.set_trace()
 
-
-
             # cv2.imwrite(dirname + '/map.png', tdmap['map'])
 
 
@@ -473,23 +495,42 @@ def main(*args):
     # generate_maps()
 
     # Figured from maps folder. Training set: 72 scenes. Test set: 14 scenes.
+    split = 'train'
+    episodes_per_scene = 50
+    spinning = False
+    mix_random_policy = True
 
-    # train
-    # num_episodes = 72 * 100 * 2  # 72 training scenes. 200 per scene. Actually there are total 88, training less. Ended with Brevort.
-    #skip_first_n = 14400
+    if split == 'train':
+        # train
+        num_episodes = 72 * episodes_per_scene * 1  # 72 training scenes. 200 per scene. Actually there are total 88, training less. Ended with Brevort.
+        skip_first_n = 3600 # 0  # 14400
+    elif split == 'val':
+        # val
+        num_episodes = 15 * episodes_per_scene * 2  # ? test scenes. 100 per scene. Actually there are total 88, training less. Ended with Brevort.
+        skip_first_n = 0
+    else:
+        raise ValueError()
 
-    # val
-    num_episodes = 15 * 100 * 2  # ? test scenes. 100 per scene. Actually there are total 88, training less. Ended with Brevort.
-    skip_first_n = 0
-    spin_every_forward_n = 12  # 3 meters
-    spin_before_done = True
+
+    # ---------
 
     if len(args) >= 2 and args[0] == '--num_episodes':
         num_episodes = args[1]
 
+    # Spinning
+    if spinning:
+        spin_every_forward_n = 12  # 3 meters
+        spin_before_done = True
+    else:
+        spin_every_forward_n = 10000
+        spin_before_done = False
+
     generate_scenarios(num_episodes=num_episodes, skip_first_n=skip_first_n,
                        spin_every_forward_n=spin_every_forward_n,
-                       spin_before_done=spin_before_done)
+                       spin_before_done=spin_before_done,
+                       mix_random_policy=mix_random_policy,
+                       episodes_per_scene=episodes_per_scene,
+                       split=split)
 
 
 if __name__ == "__main__":

@@ -1,1 +1,9 @@
 habitat-challenge-data/
+pointnav_gibson_v2.zip
+temp/
+res/
+maps/
+examples/
+data/s*
+data/habs*
+data/v*

@@ -7,19 +7,29 @@ import cv2
 from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat.utils.visualizations import maps
 from myhabitatagent import DSLAMAgent
+import numpy as np
 
 from arguments import parse_args
 
 
 class RandomAgent(habitat.Agent):
-    def __init__(self, task_config: habitat.Config):
+    def __init__(self, task_config: habitat.Config, params=None):
         self._POSSIBLE_ACTIONS = task_config.TASK.POSSIBLE_ACTIONS
+        print (params)
 
     def reset(self):
+        print ("reseting..")
+        self.step_i = 0
         pass
 
     def act(self, observations):
-        return {"action": numpy.random.choice(self._POSSIBLE_ACTIONS)}
+        self.step_i += 1
+        if self.step_i > 100:
+            action = 0
+        else:
+            action = numpy.random.choice([1, 2, 3])
+        print (self.step_i, action)
+        return {"action": action}
 
 
 class ShortestPathAgent(habitat.Agent):
@@ -64,7 +74,11 @@ class ShortestPathAgent(habitat.Agent):
 
 def main():
     params = parse_args(default_files=('./habitat_submission.conf', ))
-    is_submission = (params.gibson_mode == 'submission')
+    is_submission = (params.habitat_eval != 'localtest')
+
+    if params.seed > 0:
+        np.random.seed(params.seed)
+        random.seed(params.seed)
 
     if not is_submission:
         os.environ["CHALLENGE_CONFIG_FILE"] = './configs/challenge_pointnav_supervised.yaml'
@@ -80,23 +94,40 @@ def main():
     config_paths = os.environ["CHALLENGE_CONFIG_FILE"]
     config = habitat.get_config(config_paths)
 
-    grid_cell_size = 0.05  # 5cm
-    map_size = (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / grid_cell_size
-    assert config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION == int(map_size)
-
     print ("Using config file(s): %s"%(str(config_paths)))
     # agent = RandomAgent(task_config=config)
 
-    if params.habitat_eval == "local":
+    if params.habitat_eval == "localtest":
+        grid_cell_size = 0.05  # 5cm
+        map_size = (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / grid_cell_size
+        assert config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION == int(map_size)
+
         challenge = habitat.Challenge(eval_remote=False)
         env = challenge._env
+
+        if params.seed > 0:
+            env._sim.seed(params.seed)
+            env.seed(params.seed)
+
         # agent = ShortestPathAgent(task_config=config, env=env)
         agent = DSLAMAgent(task_config=config, params=params, env=env)
-        challenge.submit(agent, num_episodes=25)
+        challenge.submit(agent, num_episodes=params.num_episodes, skip_first_n=params.skip_first_n)
+
+    elif params.habitat_eval == "local":
+        challenge = habitat.Challenge(eval_remote=False)
+
+        # if params.seed > 0:
+        #     challenge._env._sim.seed(params.seed)
+        #     challenge._env.seed(params.seed)
+
+        agent = DSLAMAgent(task_config=config, params=params, env=None)
+        # agent = RandomAgent(task_config=config, params=params)
+        challenge.submit(agent)  # , num_episodes=params.num_episodes)
 
     else:
         challenge = habitat.Challenge(eval_remote=True)
         agent = DSLAMAgent(task_config=config, params=params, env=None)
+        # agent = RandomAgent(task_config=config, params=params)
         challenge.submit(agent)
 
 

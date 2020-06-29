@@ -1,7 +1,9 @@
 ENVIRONMENT:
   MAX_EPISODE_STEPS: 500
   ITERATOR_OPTIONS:
-    SHUFFLE: False
+    SHUFFLE: False  # False
+    MAX_SCENE_REPEAT_EPISODES: 10
+
 SIMULATOR:
   TURN_ANGLE: 30
   AGENT_0:
@@ -38,7 +40,7 @@ SIMULATOR:
 TASK:
   TYPE: Nav-v0
   SUCCESS_DISTANCE: 0.36 # 2 x Agent Radius
-  SENSORS: ['POINTGOAL_SENSOR', 'HEADING_SENSOR', 'GPS_SENSOR']
+  SENSORS: ['POINTGOAL_SENSOR', 'HEADING_SENSOR', 'GPS_SENSOR', 'POINTGOAL_WITH_GPS_COMPASS_SENSOR']
   POINTGOAL_SENSOR:
     GOAL_FORMAT: POLAR
     DIMENSIONALITY: 2
@@ -51,7 +53,7 @@ TASK:
 
 DATASET:
   TYPE: PointNav-v1
-  SPLIT: val_mini
+  SPLIT: val
   DATA_PATH: habitat-challenge-data/data/datasets/pointnav/gibson/v2/{split}/{split}.json.gz
   # DATA_PATH: habitat-challenge-data/pointgoal_gibson_v2/{split}/{split}.json.gz
   SCENES_DIR: "habitat-challenge-data/data/scene_datasets/"

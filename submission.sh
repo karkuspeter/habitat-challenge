@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
 
-python agent.py --evaluation $AGENT_EVALUATION_TYPE $@
+# export CUDA_VISIBLE_DEVICES=
+
+python agent.py --habitat_eval $AGENT_EVALUATION_TYPE $@
 
