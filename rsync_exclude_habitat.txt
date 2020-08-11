@@ -13,4 +13,5 @@ dataflow-pipe*
 .gitmodules
 habitat-challenge-data/
 res/
+temp/
 build/

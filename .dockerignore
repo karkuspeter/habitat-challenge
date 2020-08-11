@@ -7,3 +7,4 @@ examples/
 data/s*
 data/habs*
 data/v*
+data/habitat/habslam-*
