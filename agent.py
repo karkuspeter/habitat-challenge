@@ -3,6 +3,7 @@ import habitat
 import random
 import numpy
 import os
+import time
 import cv2
 from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat.utils.visualizations import maps
@@ -81,7 +82,12 @@ def main():
         random.seed(params.seed)
 
     if not is_submission:
-        os.environ["CHALLENGE_CONFIG_FILE"] = './configs/challenge_pointnav_supervised.yaml'
+        if params.overwrite_agent_noise >= 0.:
+            assert  params.overwrite_agent_noise == 0.  # need a separate file otherwise
+            print("Overwriting agent noise %f" % params.overwrite_agent_noise)
+            os.environ["CHALLENGE_CONFIG_FILE"] = './configs/challenge_pointnav_supervised_nonoise.yaml'
+        else:
+            os.environ["CHALLENGE_CONFIG_FILE"] = './configs/challenge_pointnav_supervised.yaml'
 
     # parser = argparse.ArgumentParser()
     # parser.add_argument("--evaluation", type=str, required=True, choices=["local", "remote"])
@@ -95,6 +101,8 @@ def main():
     config = habitat.get_config(config_paths)
 
     print ("Using config file(s): %s"%(str(config_paths)))
+    logdir ='./temp/evals/{}-{}'.format(time.strftime('%m-%d-%H-%M-%S', time.localtime()), params.name)  # this is only used for videos now, should pass it in to challenge eval
+    os.makedirs(logdir)
     # agent = RandomAgent(task_config=config)
 
     if params.habitat_eval == "localtest":
@@ -110,7 +118,7 @@ def main():
             env.seed(params.seed)
 
         # agent = ShortestPathAgent(task_config=config, env=env)
-        agent = DSLAMAgent(task_config=config, params=params, env=env)
+        agent = DSLAMAgent(task_config=config, params=params, env=env, logdir=logdir)
         challenge.submit(agent, num_episodes=params.num_episodes, skip_first_n=params.skip_first_n)
 
     elif params.habitat_eval == "local":
@@ -120,13 +128,13 @@ def main():
         #     challenge._env._sim.seed(params.seed)
         #     challenge._env.seed(params.seed)
 
-        agent = DSLAMAgent(task_config=config, params=params, env=None)
+        agent = DSLAMAgent(task_config=config, params=params, env=None, logdir=logdir)
         # agent = RandomAgent(task_config=config, params=params)
         challenge.submit(agent)  # , num_episodes=params.num_episodes)
 
     else:
         challenge = habitat.Challenge(eval_remote=True)
-        agent = DSLAMAgent(task_config=config, params=params, env=None)
+        agent = DSLAMAgent(task_config=config, params=params, env=None, logdir=logdir)
         # agent = RandomAgent(task_config=config, params=params)
         challenge.submit(agent)
 

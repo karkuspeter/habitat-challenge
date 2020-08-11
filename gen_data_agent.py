@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-import shutil
 
 import numpy as np
 
@@ -13,13 +12,14 @@ import habitat
 from habitat.core.utils import try_cv2_import
 from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat.utils.visualizations import maps
-from habitat.utils.visualizations.utils import images_to_video
 
 import json
 import time
 import tensorflow as tf
 import tqdm
 from tfrecordfeatures import tf_bytelist_feature, tf_bytes_feature, tf_int64_feature
+
+from habitat_utils import get_all_floors_from_file, get_floor
 
 cv2 = try_cv2_import()
 
@@ -84,23 +84,6 @@ def draw_top_down_map(info, heading, output_size):
 #     return np.sort(floor_heights)
 
 
-def get_all_floors_from_file(scene_id):
-    floor_height_path = '../GibsonSim2RealChallenge/gibson-challenge-data/dataset/%s/floors.txt'%scene_id
-    with open(floor_height_path, 'r') as f:
-        floors = sorted(list(map(float, f.readlines())))
-    print(scene_id + ' floors', floors)
-    return floors
-
-
-def get_floor(height, floor_heights):
-    floor = np.argmin(np.abs(np.array(floor_heights) - height))
-    return floor
-
-
-def get_floor_from_file(sceen_id, height):
-    floor_heights = get_all_floors_from_file(sceen_id)
-    return get_floor(height, floor_heights)
-
 
 def encode_image_to_string(image):
     if image.dtype != np.uint8:
@@ -142,18 +125,18 @@ def generate_maps():
             ep = next(episode_iterator)
             height = ep.start_position[1]
 
-            sceen_id = ep.scene_id
-            sceen_id = sceen_id.split('/')[-1]
-            sceen_id = sceen_id.split('.')[0]
-            if sceen_id not in floors_for_scene.keys():
-                floor_heights = get_all_floors_from_file(sceen_id)
-                floors_for_scene[sceen_id] = floor_heights
-                floor_filename = './maps/%s_floors.json'%sceen_id
+            scene_id = ep.scene_id
+            scene_id = scene_id.split('/')[-1]
+            scene_id = scene_id.split('.')[0]
+            if scene_id not in floors_for_scene.keys():
+                floor_heights = get_all_floors_from_file(scene_id)
+                floors_for_scene[scene_id] = floor_heights
+                floor_filename = './maps/%s_floors.json'%scene_id
                 with open(floor_filename, 'w') as file:
                     json.dump({'floor_heights': floor_heights}, file, indent=4)
-            floor = get_floor(height, floors_for_scene[sceen_id])
+            floor = get_floor(height, floors_for_scene[scene_id])
 
-            map_filename = './maps/' + sceen_id + '_%d_map.png'%floor
+            map_filename = './maps/' + scene_id + '_%d_map.png'%floor
             if map_filename not in saved_maps:
                 saved_maps.append(map_filename)
                 episodes.append(ep)
@@ -170,11 +153,11 @@ def generate_maps():
             observations, reward, done, info = env.step(2)  # turn right
             height = env.habitat_env.sim.get_agent_state().position[1]
 
-            sceen_id = env.current_episode.scene_id
-            sceen_id = sceen_id.split('/')[-1]
-            sceen_id = sceen_id.split('.')[0]
-            floor = get_floor(height,floors_for_scene[sceen_id])
-            map_filename = './maps/' + sceen_id + '_%d_map.png'%floor
+            scene_id = env.current_episode.scene_id
+            scene_id = scene_id.split('/')[-1]
+            scene_id = scene_id.split('.')[0]
+            floor = get_floor(height, floors_for_scene[scene_id])
+            map_filename = './maps/' + scene_id + '_%d_map.png'%floor
 
             # Save map
             global_map = info['top_down_map']['map']
@@ -196,17 +179,17 @@ def generate_maps():
         #
         #     height = env.habitat_env.sim.get_agent_state().position[1]
         #
-        #     sceen_id = env.current_episode.scene_id
-        #     sceen_id = sceen_id.split('/')[-1]
-        #     if sceen_id not in floors_for_scene.keys():
+        #     scene_id = env.current_episode.scene_id
+        #     scene_id = scene_id.split('/')[-1]
+        #     if scene_id not in floors_for_scene.keys():
         #         floor_heights = get_floor_heights(env.habitat_env.sim)
-        #         floors_for_scene[sceen_id] = floor_heights
-        #         floor_filename = './maps/%s_floors.json'%sceen_id
+        #         floors_for_scene[scene_id] = floor_heights
+        #         floor_filename = './maps/%s_floors.json'%scene_id
         #         with open(floor_filename, 'w') as file:
         #             json.dump({'floor_heights': floor_heights}, file, indent=4)
-        #     floor = get_floor(height, floors_for_scene[sceen_id])
+        #     floor = get_floor(height, floors_for_scene[scene_id])
         #
-        #     map_filename = './maps/' + sceen_id + '_%d_map.png'%floor
+        #     map_filename = './maps/' + scene_id + '_%d_map.png'%floor
         #     if map_filename not in saved_maps:
         #         # Save map
         #         global_map = info['top_down_map']['map']
