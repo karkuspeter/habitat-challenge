@@ -9,6 +9,7 @@ from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat.utils.visualizations import maps
 from myhabitatagent import DSLAMAgent
 import numpy as np
+import tensorflow as tf
 
 from arguments import parse_args
 
@@ -72,17 +73,18 @@ class ShortestPathAgent(habitat.Agent):
         # return {"action": numpy.random.choice(self._POSSIBLE_ACTIONS)}
 
 
-
 def main():
     params = parse_args(default_files=('./habitat_submission.conf', ))
-    is_submission = (params.habitat_eval != 'localtest')
+    is_submission = (params.habitat_eval not in ['localtest', 'gendata'])
 
     if params.seed > 0:
         np.random.seed(params.seed)
         random.seed(params.seed)
 
     if not is_submission:
-        if params.overwrite_agent_noise >= 0.:
+        if params.habitat_config_file != "":
+            os.environ["CHALLENGE_CONFIG_FILE"] = params.habitat_config_file
+        elif params.overwrite_agent_noise >= 0.:
             assert  params.overwrite_agent_noise == 0.  # need a separate file otherwise
             print("Overwriting agent noise %f" % params.overwrite_agent_noise)
             os.environ["CHALLENGE_CONFIG_FILE"] = './configs/challenge_pointnav_supervised_nonoise.yaml'
@@ -101,11 +103,12 @@ def main():
     config = habitat.get_config(config_paths)
 
     print ("Using config file(s): %s"%(str(config_paths)))
-    logdir ='./temp/evals/{}-{}'.format(time.strftime('%m-%d-%H-%M-%S', time.localtime()), params.name)  # this is only used for videos now, should pass it in to challenge eval
-    os.makedirs(logdir)
+    logdir = params.logpath if params.logpath != '' \
+        else './temp/evals/{}-{}'.format(time.strftime('%m-%d-%H-%M-%S', time.localtime()), params.name)  # this is only used for videos now, should pass it in to challenge eval
+    os.makedirs(logdir, exist_ok=True)
     # agent = RandomAgent(task_config=config)
 
-    if params.habitat_eval == "localtest":
+    if params.habitat_eval in ["localtest", "gendata"]:
         grid_cell_size = 0.05  # 5cm
         map_size = (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / grid_cell_size
         assert config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION == int(map_size)
@@ -118,8 +121,24 @@ def main():
             env.seed(params.seed)
 
         # agent = ShortestPathAgent(task_config=config, env=env)
-        agent = DSLAMAgent(task_config=config, params=params, env=env, logdir=logdir)
-        challenge.submit(agent, num_episodes=params.num_episodes, skip_first_n=params.skip_first_n)
+
+        if params.habitat_eval == "gendata":
+            assert len(params.data_map_sizes) > 0
+
+            # Initialize writers
+            data_filenames = [os.path.join(
+                logdir, "agentplandata.m%d.%d-%d.tfrecords"%(map_size, params.skip_first_n, params.num_episodes))
+                for map_size in params.data_map_sizes]
+
+            # with statement for variable number of items
+            from contextlib import ExitStack
+            with ExitStack() as stack:
+                tfwriters = [stack.enter_context(tf.python_io.TFRecordWriter(data_filename)) for data_filename in data_filenames]
+                agent = DSLAMAgent(task_config=config, params=params, env=env, logdir=logdir, tfwriters=tfwriters)
+                challenge.submit(agent, num_episodes=params.num_episodes, skip_first_n=params.skip_first_n)
+        else:
+            agent = DSLAMAgent(task_config=config, params=params, env=env, logdir=logdir)
+            challenge.submit(agent, num_episodes=params.num_episodes, skip_first_n=params.skip_first_n)
 
     elif params.habitat_eval == "local":
         challenge = habitat.Challenge(eval_remote=False)

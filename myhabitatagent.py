@@ -9,10 +9,12 @@ import time
 from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat.utils.visualizations import maps
 from gibsonagents.expert import Expert
-from gibsonagents.pathplanners import Dstar_planner, Astar3D
+from gibsonagents.pathplanners import Dstar_planner, Astar3D, VI_planner
 from gibsonagents.classic_mapping import rotate_2d, ClassicMapping
 from utils.dotdict import dotdict
+from utils.tfrecordfeatures import tf_bytes_feature, tf_bytelist_feature, tf_int64_feature
 from habitat_utils import load_map_from_file
+from vin import grid_actions_from_trajectory
 
 from arguments import parse_args
 
@@ -22,6 +24,7 @@ from train import get_brain, get_tf_config
 from common_net import load_from_file, count_number_trainable_params
 from visualize_mapping import plot_viewpoints, plot_target_and_path, mapping_visualizer
 from gen_habitat_data import actions_from_trajectory
+from gen_planner_data import rotate_map_and_poses, Transform2D
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -61,19 +64,26 @@ SUPRESS_EXCEPTIONS = False
 # GIVE_UP_STEP_AND_DISTANCE = [[0, 440], [150, 320], [300, 250], [400, 150]]   # NOTE if changing first threshold also change max map size.
 # GIVE_UP_TIME_AND_REDUCTION = [[10., 100], [15., 120], [20., 300], [30., 400]]   # in minutes ! and  distance reduction from beginning
 
-# Almost never give up -- august submission
-GIVE_UP_NO_PROGRESS_STEPS = 200  # 100
-NO_PROGRESS_THRESHOLD = 12
-GIVE_UP_NUM_COLLISIONS = 25
-GIVE_UP_STEP_AND_DISTANCE = [[0, 440], [150, 320], [300, 250], [400, 150]]   # NOTE if changing first threshold also change max map size.
-GIVE_UP_TIME_AND_REDUCTION = [[10., 100], [15., 120], [20., 300], [30., 400]]   # in minutes ! and  distance reduction from beginning
+# # Almost never give up -- august submission
+# GIVE_UP_NO_PROGRESS_STEPS = 100
+# NO_PROGRESS_THRESHOLD = 12
+# GIVE_UP_NUM_COLLISIONS = 25
+# GIVE_UP_STEP_AND_DISTANCE = [[0, 440], [150, 320], [300, 250], [400, 150]]   # NOTE if changing first threshold also change max map size.
+# GIVE_UP_TIME_AND_REDUCTION = [[10., 100], [15., 120], [20., 300], [30., 400]]   # in minutes ! and  distance reduction from beginning
 
-# # No giveup
-# GIVE_UP_NO_PROGRESS_STEPS = 1000  # 100
+# # no giveup but 300 limit for data generation
+# GIVE_UP_NO_PROGRESS_STEPS = 1000
 # NO_PROGRESS_THRESHOLD = 1
 # GIVE_UP_NUM_COLLISIONS = 1000
-# GIVE_UP_STEP_AND_DISTANCE = []   # NOTE if changing first threshold also change max map size.
+# GIVE_UP_STEP_AND_DISTANCE = [[300, 1], ]   # NOTE if changing first threshold also change max map size.
 # GIVE_UP_TIME_AND_REDUCTION = []   # in minutes ! and  distance reduction from beginning
+
+# No giveup
+GIVE_UP_NO_PROGRESS_STEPS = 1000  # 100
+NO_PROGRESS_THRESHOLD = 1
+GIVE_UP_NUM_COLLISIONS = 1000
+GIVE_UP_STEP_AND_DISTANCE = []   # NOTE if changing first threshold also change max map size.
+GIVE_UP_TIME_AND_REDUCTION = []   # in minutes ! and  distance reduction from beginning
 
 # # Very agressive for fast testing
 # GIVE_UP_NO_PROGRESS_STEPS = 50  # 100
@@ -89,19 +99,24 @@ MANUAL_STOP_WHEN_NEAR_TARGET = False
 RECOVER_ON_COLLISION = True
 COLLISION_DISTANCE_THRESHOLD = 0.6  # 0.8
 MAX_SHORTCUT_TURNS = 2  # was 1 in submission
+NEAR_TARGET_COLLISION_STOP_DISTANCE = 5.  # when colliding withing this radius to the goal, stop instead
 
 # # Patch map with collisions and around target
 CLEAR_TARGET_RADIUS = 4   # 5  # 0  # 5
+TARGET_MAP_MARGIN = 2
+ALLOW_SHRINK_MAP = True
 
 OBSTACLE_DOWNWEIGHT_DISTANCE = 20  # from top, smaller the further
 OBSTACLE_DOWNWEIGHT_SCALARS = (0.3, 0.8) # (0.3, 0.8)
+EXTRA_STEPS_WHEN_EXPANDING_MAP = 30
 
 # !!!!!!
 PLOT_EVERY_N_STEP = -1
 USE_ASSERTS = True
 # 42 * 60 * 60 - 3 * 60 * 60   #  30 * 60 - 5 * 60  #
 TOTAL_TIME_LIMIT =  42 * 60 * 60 - 90 * 60   # challenge gave up at 38h and finished at 39h so 90 minutes should be enough
-# 42 hours = 2520 mins for 1000-2000 episodes. So average episode time should be < 75.6 sec
+# 42 hours = 2520 mins for 1000-2000 episodes.
+# Average episode time should be < 75.6 sec
 ERROR_ON_TIMEOUT = False   #  True
 SKIP_FIRST_N_FOR_TEST = -1  # 10  # 10  # 10
 VIDEO_FRAME_SKIP = 6
@@ -113,12 +128,13 @@ EXIT_AFTER_N_STEPS_FOR_SPEED_TEST = -1
 FAKE_INPUT_FOR_SPEED_TEST = False
 MAX_MAP_SIZE_FOR_SPEED_TEST = False
 
+# DATA GENERATION
+DATA_INCLUDE_NONPLANNED_ACTIONS = False
 
-EXTRA_STEPS_WHEN_EXPANDING_MAP = 30
 
 
 class DSLAMAgent(habitat.Agent):
-    def __init__(self, task_config, params, env=None, logdir='./temp/'):
+    def __init__(self, task_config, params, env=None, logdir='./temp/', tfwriters=()):
         self.start_time = time.time()
 
         self._POSSIBLE_ACTIONS = task_config.TASK.POSSIBLE_ACTIONS
@@ -126,6 +142,8 @@ class DSLAMAgent(habitat.Agent):
         self.episode_i = -2
         self.env = env
         self.task_config = task_config
+        self.tfwriters = tfwriters
+        self.num_data_entries = 0
         if env is None:
             self.follower = None
             assert ACTION_SOURCE != "expert"
@@ -151,8 +169,10 @@ class DSLAMAgent(habitat.Agent):
         self.confidence_threshold = None  # (0.2, 0.01)  # (0.35, 0.05)
         self.use_custom_visibility = (self.params.visibility_mask in [2, 20, 21])
 
-        assert self.params.agent_map_source in ['true', 'true-saved', 'pred']
+        assert self.params.agent_map_source in ['true', 'true-saved', 'true-partial', 'pred']
         assert self.params.agent_pose_source in ['slam', 'slam-truestart', 'true']
+
+        _, gpuname = get_tf_config(devices=params.gpu)  # sets CUDA_VISIBLE_DEVICES
 
         if params.skip_slam:
             print ("SKIP SLAM overwritting particles and removing noise.")
@@ -165,36 +185,47 @@ class DSLAMAgent(habitat.Agent):
 
         self.map_ch = 2
         # slam_map_ch = 1
-
-        if self.params.planner == 'astar3d':
-            self.max_map_size = (370, 370)  # also change giveup setting when changing this
-            self.fixed_map_size = True
-            # assert MAP_SOURCE != "true"
-            self.pathplanner = Astar3D(single_thread=False, max_map_size=self.max_map_size, timeout=self.params.planner_timeout)
-        else:
-            self.max_map_size = (900, 900)
-            self.fixed_map_size = False
-            self.pathplanner = Dstar_planner(single_thread=False, max_map_size=self.max_map_size)
-        self.top_down_map_resolution = self.task_config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION
+        self.max_map_size = (self.params.global_map_size, self.params.global_map_size)  # (360, 360)
 
         params.batchsize = 1
         params.trajlen = 1
         sensor_ch = (1 if params.mode == 'depth' else (3 if params.mode == 'rgb' else 4))
         batchsize = params.batchsize
 
-        _, gpuname = get_tf_config(devices=params.gpu)  # sets CUDA_VISIBLE_DEVICES
+        if params.seed is not None and params.seed > 0:
+            print("Fix Numpy and TF seed to %d" % params.seed)
+            tf.set_random_seed(params.seed)
+            np.random.seed(params.seed)
+            random.seed(params.seed)
 
-        # Build brain
+        # Build graph for slam and planner
         with tf.Graph().as_default():
-
-            if params.seed is not None and params.seed > 0:
-                print ("Fix Numpy and TF seed to %d" % params.seed)
-                tf.set_random_seed(params.seed)
-                np.random.seed(params.seed)
-                random.seed(params.seed)
-
-            # test data and network
             with tf.variable_scope(tf.get_variable_scope(), reuse=False):
+                # Choose planner
+                if self.params.planner == 'astar3d':
+                    self.max_map_size = (370, 370)  # also change giveup setting when changing this
+                    self.fixed_map_size = True
+                    # assert MAP_SOURCE != "true"
+                    self.pathplanner = Astar3D(single_thread=False, max_map_size=self.max_map_size, timeout=self.params.planner_timeout)
+                elif self.params.planner == 'dstar_track_fixsize':
+                    self.fixed_map_size = True
+                    self.pathplanner = Dstar_planner(single_thread=False, max_map_size=self.max_map_size)
+                elif self.params.planner in ['dstar_track', 'dstar2d']:
+                    self.max_map_size = (900, 900)
+                    self.fixed_map_size = False
+                    self.pathplanner = Dstar_planner(single_thread=False, max_map_size=self.max_map_size)
+                elif self.params.planner in ['vi4', 'vi8', 'vi4-e1', 'vi8-e1']:
+                    self.fixed_map_size = True
+                    self.pathplanner = VI_planner(max_map_size=(None, None), brain="trueplanner", params=self.params, connect8=(self.params.planner in ['vi8', 'vi8-e1']))
+                elif self.params.planner in ['vin', 'vin-e1']:
+                    self.fixed_map_size = True
+                    self.pathplanner = VI_planner(max_map_size=(None, None), brain="plannerbrain_v16", params=self.params, connect8=False)
+                else:
+                    raise ValueError("Unknown planner %s"%self.params.planner)
+
+                self.top_down_map_resolution = self.task_config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION
+
+                # Test data and network
                 assert params.target in ["traj"]
 
                 train_brain = get_brain(params.brain, params)
@@ -352,9 +383,6 @@ class DSLAMAgent(habitat.Agent):
             load_from_file(self.sess, params.load, partialload=params.partialload, loadcenter=[],
                            skip=params.loadskip, autorename=False)
 
-
-        self.scan_map_erosion = 5
-
         self.global_map_logodds = None
         self.xy = None
         self.yaw = None
@@ -384,6 +412,8 @@ class DSLAMAgent(habitat.Agent):
         self.accumulated_spin = 0.
         self.spin_direction = None
         self.distance_history = []
+        self.raw_xy_transform = lambda xys: xys
+        self.raw_yaw_offset = 0.
 
         self.recover_step_i = 0
         self.num_collisions = 0
@@ -394,6 +424,7 @@ class DSLAMAgent(habitat.Agent):
         self.num_wrong_free_area2 = 0
         self.num_wrong_free_area3 = 0
         self.map_mismatch_count = 0
+        self.plan_times = []
 
         assert self.params.recoverpolicy in ['back5', 'back1']
         num_recover_back_steps = (5 if self.params.recoverpolicy == 'back5' else 1)
@@ -401,6 +432,9 @@ class DSLAMAgent(habitat.Agent):
 
         self.global_map_logodds = None  # will initialize in act() np.zeros((1, 1) + (1, ), np.float32)
         self.collision_timesteps = []
+
+        for tfwriter in self.tfwriters:
+            tfwriter.flush()
 
         self.pathplanner.reset()
 
@@ -411,7 +445,7 @@ class DSLAMAgent(habitat.Agent):
     def drop_output(self, outputs, drop_names):
         return dotdict({key: val for key, val in outputs.items() if key not in drop_names})
 
-    def plan_and_control(self, xy, yaw, target_xy, global_map_pred, ang_vel, target_fi):
+    def plan_and_control(self, xy, yaw, target_xy, global_map_pred, ang_vel, target_fi, allow_shrink_map=False):
 
         if self.start_with_spin and np.abs(self.accumulated_spin) < SPIN_TARGET and self.step_i < 40:
             if self.spin_direction is None:
@@ -423,19 +457,24 @@ class DSLAMAgent(habitat.Agent):
 
             action = (2 if self.spin_direction > 0 else 3)
             planned_path = np.zeros((0, 2))
-            return action, planned_path, status_message
+            return action, planned_path, status_message, (global_map_pred * 255.).astype(np.uint8)
 
         if not self.params.soft_cost_map:
             assert global_map_pred.dtype == np.float32
             global_map_pred = (global_map_pred * 255.).astype(np.uint8)
 
+        if allow_shrink_map:
+            xy, target_xy, global_map_pred, offset_xy = self.shrink_map(xy, target_xy, global_map_pred)
+        else:
+            offset_xy = None
+
         # Scan map and cost graph.
-        scan_graph, scan_map, resized_scan_map, costmap = Expert.get_graph_and_eroded_map(
+        scan_graph, eroded_scan_map, normal_scan_map, costmap = Expert.get_graph_and_eroded_map(
             raw_trav_map=global_map_pred[..., :1],
             trav_map_for_simulator=global_map_pred[..., :1],
             raw_scan_map=global_map_pred,
             rescale_scan_map=1.,
-            erosion=self.scan_map_erosion,
+            erosion=self.params.map_erosion_for_planning,
             build_graph=False,
             interactive_channel=False,
             cost_setting=self.params.cost_setting,
@@ -465,34 +504,49 @@ class DSLAMAgent(habitat.Agent):
         # temp_filter = np.logical_and(temp_map2 < 255, temp_map1 == 255)
         # costmap[temp_filter] = 1.
         assert self.params.goalpolicy in ['twostep', 'none']
+        start_time = time.time()
 
         if self.params.planner == 'astar3d':
             assert self.params.goalpolicy in ['twostep']  # need to add support below for removing twostep
             action, obstacle_distance, planned_path, status_message = Expert.discrete3d_policy(
-                scan_map=scan_map, pos_map_float=xy, yaw=yaw, target_map_float=target_xy, cost_map=costmap,
+                scan_map=eroded_scan_map, pos_map_float=xy, yaw=yaw, target_map_float=target_xy, cost_map=costmap,
                 pathplanner=self.pathplanner)
-
         elif self.params.planner == 'dstar2d':
             assert self.params.goalpolicy in ['twostep']  # need to add support below for removing twostep
             action, obstacle_distance, planned_path, status_message = Expert.discrete_policy(
-                scan_map=scan_map, pos_map_float=xy, yaw=yaw, target_map_float=target_xy, cost_map=costmap,
+                scan_map=eroded_scan_map, pos_map_float=xy, yaw=yaw, target_map_float=target_xy, cost_map=costmap,
                 use_asserts=True,
-                shortest_path_fn=lambda _, source_tuple, target_tuple, cost_map: self.pathplanner.dstar_path(
+                shortest_path_fn=lambda _, source_tuple, target_tuple, cost_map, scan_map: self.pathplanner.dstar_path(
                     cost_map, source_tuple, target_tuple, timeout=PLANNER2D_TIMEOUT))
-
-        elif self.params.planner == 'dstar_track':
+        elif self.params.planner in ['dstar_track', 'dstar_track_fixsize']:
             action, obstacle_distance, planned_path, status_message = Expert.discrete_tracking_policy(
-                scan_map=scan_map, pos_map_float=xy, yaw=yaw, target_map_float=target_xy, cost_map=costmap,
+                scan_map=eroded_scan_map, pos_map_float=xy, yaw=yaw, target_map_float=target_xy, cost_map=costmap,
                 use_lookahead=True, use_twostep_approach=(self.params.goalpolicy == 'twostep'),
-                shortest_path_fn=lambda _, source_tuple, target_tuple, cost_map: self.pathplanner.dstar_path(
+                shortest_path_fn=lambda _, source_tuple, target_tuple, cost_map, scan_map: self.pathplanner.dstar_path(
                     cost_map, source_tuple, target_tuple, timeout=PLANNER2D_TIMEOUT))
+        elif self.params.planner in ['vi4', 'vi8', 'vin']:
+            action, obstacle_distance, planned_path, status_message = Expert.discrete_tracking_policy(
+                scan_map=eroded_scan_map, pos_map_float=xy, yaw=yaw, target_map_float=target_xy, cost_map=costmap,
+                use_lookahead=True, use_twostep_approach=(self.params.goalpolicy == 'twostep'),
+                shortest_path_fn=lambda _, source_tuple, target_tuple, cost_map, scan_map: self.pathplanner.vi_path(
+                    scan_map, cost_map, source_tuple, target_tuple, sess=self.sess))
+        elif self.params.planner in ['vi4-e1', 'vi8-e1', 'vin-e1']:
+            action, obstacle_distance, planned_path, status_message = Expert.discrete_tracking_policy(
+                scan_map=eroded_scan_map, pos_map_float=xy, yaw=yaw, target_map_float=target_xy, cost_map=costmap,
+                use_lookahead=True, use_twostep_approach=(self.params.goalpolicy == 'twostep'),
+                shortest_path_fn=lambda _, source_tuple, target_tuple, cost_map, scan_map: self.pathplanner.vi_path(
+                    normal_scan_map, cost_map, source_tuple, target_tuple, sess=self.sess))
         else:
             raise ValueError("Unknown planner %s"%(self.params.planner))
 
         status_message = "%d/%d: %.2f %s"%(self.episode_i, self.step_i, time.time()-self.t, status_message)
         self.t = time.time()
+        self.plan_times.append(time.time() - start_time)
 
-        return action, planned_path, status_message
+        if allow_shrink_map:
+            planned_path = planned_path + offset_xy[None]
+
+        return action, planned_path, status_message, eroded_scan_map
 
     def act(self, observations):
         if SUPRESS_EXCEPTIONS:
@@ -569,42 +623,60 @@ class DSLAMAgent(habitat.Agent):
             assert self.pose_source != 'slam'
 
             info = self.env.get_metrics()
-            true_xy = np.array(info['top_down_map']['agent_map_coord'])  # x: downwards; y: rightwars
-            true_yaw = info['top_down_map']['agent_angle']  # 0 downwards, positive ccw. Forms stanard coord system with x and y.
-            true_yaw = np.array((true_yaw, ), np.float32)
-            true_yaw = (true_yaw + np.pi) % (2 * np.pi) - np.pi  # normalize
-            # Recover from simulator pos
             agent_pos = self.env.sim.get_agent_state().position
             goal_pos = self.env.current_episode.goals[0].position
-            true_xy_from_pos = maps.to_grid(agent_pos[0], agent_pos[2], maps.COORDINATE_MIN, maps.COORDINATE_MAX,
-                                   (self.top_down_map_resolution, self.top_down_map_resolution), keep_float=True)
-            offset_xy = true_xy - true_xy_from_pos
-            true_target_xy = maps.to_grid(goal_pos[0], goal_pos[2], maps.COORDINATE_MIN, maps.COORDINATE_MAX,
-                                          (self.top_down_map_resolution, self.top_down_map_resolution), keep_float=True)
-            true_target_xy += offset_xy
 
+            # First deal with observed map and optionally samplre random rotation
             true_global_map = info['top_down_map']['map']
             true_global_map = (true_global_map > 0).astype(np.uint8) * 255
             true_global_map = np.atleast_3d(true_global_map)
 
             if self.step_i > 0:
                 # Count pixels that used to be free but not in the latest map
-                new_map_mismatch_count = np.count_nonzero(np.logical_and(true_global_map == 0, self.last_true_global_map))
-                if new_map_mismatch_count > 200:
-                    print ("TOO MANY MAP MISMATCHES %d"%new_map_mismatch_count)
-                    # assert False
-                    
-                self.map_mismatch_count += new_map_mismatch_count
+                if not self.params.random_rotations:
+                    new_map_mismatch_count = np.count_nonzero(np.logical_and(true_global_map == 0, self.last_true_global_map))
+                    if new_map_mismatch_count > 200:
+                        print ("TOO MANY MAP MISMATCHES %d"%new_map_mismatch_count)
+                        # assert False
+                    self.map_mismatch_count += new_map_mismatch_count
                 true_global_map = self.last_true_global_map  # keep the first
             elif self.map_source == 'true-saved':
                 saved_global_map = load_map_from_file(scene_id=self.get_scene_name(), height=agent_pos[1])
                 assert saved_global_map.dtype == np.uint8
                 assert saved_global_map.shape == true_global_map.shape
                 self.map_mismatch_count  = np.count_nonzero(np.logical_and(saved_global_map, true_global_map))
-                self.last_true_global_map  = saved_global_map
+                assert not self.params.random_rotations
+                true_global_map = saved_global_map
+                self.last_true_global_map = saved_global_map
             else:
+                # rotate true map once and keep this for the episode. Remember the transformation and apply it from all raw observations
+                if self.params.random_rotations:
+                    self.raw_yaw_offset = np.random.rand() * 2. * np.pi
+                    true_global_map, new_poses, transform = rotate_map_and_poses(true_global_map,  self.raw_yaw_offset, poses=[np.zeros((1, 2), np.float32)], constant_value=0)
+                    assert true_global_map.dtype == np.uint8
+                    # Reapply threshold
+                    true_global_map = (true_global_map > 128).astype(np.uint8) * 255
+                    self.raw_xy_transform = transform
                 self.map_mismatch_count  = 0
                 self.last_true_global_map = true_global_map
+
+            # Deal with observed pose
+            true_xy = np.array(info['top_down_map']['agent_map_coord'])  # x: downwards; y: rightwars
+            true_xy = self.raw_xy_transform(true_xy[None])[0]
+            true_yaw = info['top_down_map']['agent_angle']  # 0 downwards, positive ccw. Forms stanard coord system with x and y.
+            true_yaw = true_yaw + self.raw_yaw_offset
+            true_yaw = np.array((true_yaw, ), np.float32)
+            true_yaw = (true_yaw + np.pi) % (2 * np.pi) - np.pi  # normalize
+            # Recover from simulator pos
+            true_xy_from_pos = maps.to_grid(agent_pos[0], agent_pos[2], maps.COORDINATE_MIN, maps.COORDINATE_MAX,
+                                   (self.top_down_map_resolution, self.top_down_map_resolution), keep_float=True)
+            true_xy_from_pos = self.raw_xy_transform(np.array(true_xy_from_pos, np.float32)[None])[0]
+            offset_xy = true_xy - true_xy_from_pos
+            true_target_xy = maps.to_grid(goal_pos[0], goal_pos[2], maps.COORDINATE_MIN, maps.COORDINATE_MAX,
+                                          (self.top_down_map_resolution, self.top_down_map_resolution), keep_float=True)
+            true_target_xy = self.raw_xy_transform(np.array(true_target_xy, np.float32)[None])[0]
+            true_target_xy += offset_xy
+            del offset_xy
 
         else:
             true_xy = np.zeros((2,), np.float32)
@@ -619,6 +691,8 @@ class DSLAMAgent(habitat.Agent):
                 # Initialize with true things. Only makes sense if we access it
                 assert self.env is not None
                 self.true_xy_offset = -true_xy.astype(np.int32)
+                # self.true_xy_transform = Transform2D
+                # self.true_xy_transform.add_translation()
                 if self.fixed_map_size:
                     self.global_map_logodds = np.zeros((self.max_map_size[0], self.max_map_size[1], 1), np.float32)   # np.zeros(true_global_map.shape, np.float32)
                 else:
@@ -679,23 +753,48 @@ class DSLAMAgent(habitat.Agent):
             self.true_yaw_traj = [true_yaw]
             self.action_traj = []
 
-        # if self.pose_source in ["slam", "slam-truestart"]:
+        # Resize map and add offset
         map_shape = self.global_map_logodds.shape
         if self.fixed_map_size:
+            xy_map_margin = 10  # this is before slam update. a single step can move 6 cells plus estimation may change
+
             # Keep a fixed map size. Dont even update it, only move the offset, such that center point is between current pose and goal
             assert map_shape[:2] == self.max_map_size
+            assert self.max_map_size[0] == self.max_map_size[1]
 
             center_xy = (self.xy + self.target_xy) * 0.5
             desired_center_xy = np.array(self.max_map_size, np.float32) * 0.5
             offset_xy = (desired_center_xy - center_xy).astype(np.int)
 
-            if np.any(offset_xy != 0):
-                self.particle_xy_list = [xy + offset_xy for xy in self.particle_xy_list]
-                self.target_xy += offset_xy
-                self.true_xy_offset += offset_xy
-                self.xy += offset_xy
+            new_xy = self.xy + offset_xy
 
-            # TODO handle too large distance. Also after slam step - if pose or target not in map, just give up
+            # Handle the case when xy would fall out of the map area or would be too near the edge.
+            # These will be only nonzero if xy is outside the allowed area
+            # if np.any(new_xy < xy_map_margin):
+            offset_xy += np.ceil(np.maximum(xy_map_margin - new_xy, 0.)).astype(np.int32)
+            # if np.any(new_xy >= self.max_map_size[0] - xy_map_margin):
+            offset_xy -= np.ceil(np.maximum(new_xy - (self.max_map_size[0] - xy_map_margin), 0.)).astype(np.int32)
+
+            self.particle_xy_list = [xy + offset_xy for xy in self.particle_xy_list]
+            self.target_xy += offset_xy
+            self.true_xy_offset += offset_xy
+            self.xy += offset_xy
+
+            # Handle the case when target is outside of the map area
+            if np.any(self.target_xy < TARGET_MAP_MARGIN) or np.any(self.target_xy >= self.max_map_size[0] - TARGET_MAP_MARGIN):
+                # Find the free map cell closest to the target
+                global_map_pred = ClassicMapping.inverse_logodds(self.global_map_logodds)
+                free_x, free_y = np.nonzero(np.squeeze(global_map_pred[TARGET_MAP_MARGIN:-TARGET_MAP_MARGIN, TARGET_MAP_MARGIN:-TARGET_MAP_MARGIN], axis=-1) >= 0.5)
+                free_xy = np.stack([free_x, free_y], axis=-1)
+                free_xy = free_xy.astype(np.float32)
+                free_xy += 0.5
+                free_xy += TARGET_MAP_MARGIN
+                dist = np.linalg.norm(free_xy - self.target_xy[None], axis=1)
+                # pretend the closest free cell is the target
+                self.target_xy_for_planning = free_xy[np.argmin(dist)]
+                print ("Moving target within the map: %s --> %s"%(str(self.target_xy), str(self.target_xy_for_planning)))
+            else:
+                self.target_xy_for_planning = self.target_xy.copy()
 
         else:
             # Expand map and offset pose if needed, such that target and the surrounding of current pose are all in the map.
@@ -752,6 +851,7 @@ class DSLAMAgent(habitat.Agent):
                 else:
                     self.global_map_logodds = self.global_map_logodds[:, :-excess_xy[1]]
 
+            self.target_xy_for_planning = self.target_xy.copy()
             map_shape = self.global_map_logodds.shape
 
         # Offset true map
@@ -1035,11 +1135,14 @@ class DSLAMAgent(habitat.Agent):
 
         dist_hist = np.array(self.distance_history[-GIVE_UP_NO_PROGRESS_STEPS:])
 
-        # Give up becuase too far?
-        should_give_up = (np.any(self.target_xy < CLEAR_TARGET_RADIUS) or
-                          np.any(self.target_xy + CLEAR_TARGET_RADIUS >= np.array(self.max_map_size)) or
+        # Give up becuase too far. No longer needed as we move the
+        should_give_up = (np.any(self.target_xy_for_planning < TARGET_MAP_MARGIN) or
+                          np.any(self.target_xy_for_planning + TARGET_MAP_MARGIN >= np.array(self.max_map_size)) or
                           np.any(self.xy < 0) or
                           np.any(self.xy >= np.array(self.max_map_size)))
+        if USE_ASSERTS and should_give_up and self.fixed_map_size:
+            raise ValueError("Target or state is outside of map area -- this should not happen for fixed size map.")
+
         try:
             for time_thres, dist_thres in GIVE_UP_STEP_AND_DISTANCE:
                 if self.step_i >= time_thres and target_dist >= dist_thres:
@@ -1067,7 +1170,8 @@ class DSLAMAgent(habitat.Agent):
         # Plan
         planned_path = np.zeros([0, 2], dtype=np.float32)
         # Choose which map to use for planning
-        global_map_for_planning = self.get_global_map_for_planning(global_map_pred, global_map_label, traj_xy, traj_yaw, map_shape)
+        global_map_for_planning = self.get_global_map_for_planning(global_map_pred, global_map_label, traj_xy, traj_yaw, map_shape, self.map_source, keep_soft=self.params.soft_cost_map)
+        processed_map_for_planning = global_map_for_planning
         if MANUAL_STOP_WHEN_NEAR_TARGET and target_dist < 3.:
             # Close enough to target. Normal requirement is 0.36/0.05 = 7.2
             plan_status_msg = "Manual stop"
@@ -1089,8 +1193,8 @@ class DSLAMAgent(habitat.Agent):
             action = self.recover_policy[self.recover_step_i]
             self.recover_step_i += 1
             self.pathplanner.reset()  # to clear out its cache
-            if target_dist < 3.:
-                print ("Attempt to stop instead, near target")
+            if target_dist < NEAR_TARGET_COLLISION_STOP_DISTANCE:
+                plan_status_msg += " --> Attempt to stop instead, near target"
                 is_done = True
                 action = 0
 
@@ -1105,18 +1209,22 @@ class DSLAMAgent(habitat.Agent):
             action = 0
 
         else:
-            action, planned_path, plan_status_msg = self.plan_and_control(xy, yaw, self.target_xy, global_map_for_planning, ang_vel, initial_target_fi)
+            action, planned_path, plan_status_msg, processed_map_for_planning = self.plan_and_control(
+                xy, yaw, self.target_xy_for_planning, global_map_for_planning, ang_vel, initial_target_fi,
+                allow_shrink_map=self.fixed_map_size and ALLOW_SHRINK_MAP)
             is_done = (action == 0)
 
             # Visualize agent
             if self.step_i % PLOT_EVERY_N_STEP == 0 and PLOT_EVERY_N_STEP > 0 and slam_outputs is not None:
                 local_map_pred = self.local_map_traj[-1][:, :, 0]
-                self.visualize_agent(slam_outputs.tiled_visibility_mask[0, 0, :, :, 0], images, global_map_pred, global_map_for_planning, global_map_label,
+                self.visualize_agent(slam_outputs.tiled_visibility_mask[0, 0, :, :, 0], images, global_map_pred,
+                                     global_map_for_planning,
+                                     # processed_map_for_planning.astype(np.float32)/255.,
+                                     global_map_label,
                                      global_map_true_partial, local_map_pred, local_map_label, planned_path,
                                      sim_rgb=observations['rgb'],
-                                     xy=xy, yaw=yaw, true_xy=true_xy + self.true_xy_offset, true_yaw=true_yaw, target_xy=self.target_xy)
+                                     xy=xy, yaw=yaw, true_xy=true_xy + self.true_xy_offset, true_yaw=true_yaw, target_xy=self.target_xy_for_planning)
             # pdb.set_trace()
-
 
         # Overwrite with expert
         if self.action_source == 'expert':
@@ -1127,6 +1235,18 @@ class DSLAMAgent(habitat.Agent):
                 print ("Sping instead of stopping.")
                 action = 3
             is_done = (action == 0)
+
+        # Save data
+        if len(self.tfwriters) > 0:
+            if planned_path.shape[0] == 0 or target_dist < 10.5:  # two step strategy for <= 10
+                if DATA_INCLUDE_NONPLANNED_ACTIONS:
+                    raise NotImplementedError
+            else:
+                assert self.map_source != "pred"
+                pred_map_for_planning = self.get_global_map_for_planning(global_map_pred, global_map_label, traj_xy,
+                                                                           traj_yaw, map_shape, "pred", keep_soft=True)
+
+                self.write_datapoint(global_map_for_planning, pred_map_for_planning, self.target_xy_for_planning, planned_path.astype(np.int32), action)
 
         # pdb.set_trace()
         # if self.episode_i == 0:
@@ -1164,11 +1284,10 @@ class DSLAMAgent(habitat.Agent):
                 pdb.set_trace()
             self.frame_traj_data.append(dict(
                 rgb=observations['rgb'], global_map=global_map_pred.copy(),
-                true_global_map=global_map_label.copy(),
                 global_map_for_planning=global_map_for_planning.copy(),
-                # true_global_map=info['top_down_map']['map'].astype(np.float32)/255.,
+                true_global_map=global_map_label.copy(),
                 xy=self.xy.copy(), yaw=self.yaw.copy(),
-                target_xy=self.target_xy.copy(),
+                target_xy=self.target_xy_for_planning.copy(),
                 path=planned_path.copy(), # subgoal=planned_subgoal.copy(),
                 target_status=slam_status_msg, control_status=plan_status_msg, act_status=act_status_msg))
 
@@ -1178,19 +1297,134 @@ class DSLAMAgent(habitat.Agent):
                 'num_wrong_obstacle': self.num_wrong_obstacle, 'num_wrong_free': self.num_wrong_free,
                 'num_wrong_free_area': self.num_wrong_free_area,
                 'num_wrong_free_area2': self.num_wrong_free_area2, 'num_wrong_free_area3': self.num_wrong_free_area3,
+                'time_plan': 0. if len(self.plan_times) == 0 else np.mean(self.plan_times),
                 'map_mismatch_count': float(self.map_mismatch_count) / self.step_i,  # TODO remove
                 'giveup_collision': float(giving_up_collision), 'giveup_progress': float(giving_up_progress),
                 'giveup_distance': float(giving_up_distance), 'is_done: ': is_done}   # 0: stop, forward, left, right
         # return {"action": numpy.random.choice(self._POSSIBLE_ACTIONS)}
 
-    def get_global_map_for_planning(self, global_map_pred, global_map_label, traj_xy, traj_yaw, map_shape):
-        if self.map_source in ['true', 'true-saved']:
+    def write_datapoint(self, map_for_planning, pred_map, target_xy, planned_path, action):
+        assert planned_path.shape[0] > 0
+        assert planned_path.dtype == np.int32
+        planned_actions = grid_actions_from_trajectory(planned_path, connect8=False)
+        target_ij = target_xy.astype(np.int32)
+
+        if planned_path.shape[0] < self.params.trainlen:
+            return
+        if planned_path[-1][0] != target_ij[0] or planned_path[-1][1] != target_ij[1]:
+            print ("Skip because path does not reach goal")
+            print (planned_path)
+            print (target_ij)
+            return
+
+        # convert maps
+        assert map_for_planning.dtype == np.float32 and pred_map.dtype == np.float32
+        assert map_for_planning.shape == pred_map.shape
+        map_for_planning = (map_for_planning * 255.).astype(np.uint8)
+        pred_map = (pred_map * 255.).astype(np.uint8)  # encode predicted probability as uint8
+
+        assert len(self.tfwriters) == len(self.params.data_map_sizes)
+        for tfwriter, map_size in zip(self.tfwriters, self.params.data_map_sizes):
+
+            self.write_data_for_map_size(map_for_planning, pred_map, planned_actions, planned_path, target_xy, tfwriter, map_size)
+
+    def write_data_for_map_size(self, map_for_planning, pred_map, planned_actions, planned_path, target_xy, tfwriter, map_size):
+        segment_len = self.params.trainlen
+
+        if map_size < map_for_planning.shape[0]:
+            # Find last trajectory segment that is still within the map size
+            margin = 2
+            for start_i in range(len(planned_path)):
+                range_ij = np.max(planned_path[start_i:], axis=0) - np.min(planned_path[start_i:], axis=0)
+                if np.all(range_ij < map_size - 2 * margin):
+                    break
+            planned_path = planned_path[start_i:]
+            planned_actions = planned_actions[start_i:]
+
+            # Crop map
+            offset_ij = np.min(planned_path, axis=0)
+            range_ij =  np.max(planned_path, axis=0) - offset_ij
+            # add half of the remaining spacing to the beginning
+            topleft_space = (map_size - range_ij) // 2
+            offset_ij = offset_ij - topleft_space
+            offset_ij = np.maximum(offset_ij, np.zeros((2, ), np.int32))  # cannot be less than zero
+            offset_ij = np.minimum(offset_ij, np.array(map_for_planning.shape[:2], np.int32) - map_size)
+            # crop the given size starting from offset_ij
+            map_for_planning = map_for_planning[offset_ij[0]:offset_ij[0]+map_size, offset_ij[1]:offset_ij[1]+map_size]
+            pred_map = pred_map[offset_ij[0]:offset_ij[0]+map_size, offset_ij[1]:offset_ij[1]+map_size]
+
+            # Move poses to cropped frame
+            planned_path = planned_path - offset_ij[None]
+            target_xy = target_xy - offset_ij.astype(np.float32)
+
+        if planned_path.shape[0] < self.params.trainlen:
+            return
+        assert map_for_planning.shape[0] == map_size and map_for_planning.shape[1] == map_size
+        assert np.all(planned_path >= 0) and np.all(planned_path < map_size)
+
+        planned_xy = planned_path.astype(np.float32) + 0.5
+
+        true_map_png = cv2.imencode('.png', map_for_planning)[1].tobytes()
+        pred_map_png = cv2.imencode('.png', pred_map)[1].tobytes()
+        # segments
+        traj_segments = []
+        overlap = 1  # use extra step because last action will be dropped
+        assert overlap < segment_len
+        start_i = 0
+        while start_i < planned_path.shape[0]:  # include all steps
+            # for incomplete last segment, start earlier overlapping with previous segment
+            if start_i + segment_len > planned_path.shape[0]:
+                start_i = planned_path.shape[0] - segment_len
+                overlap = -1  # this is to triger break at the end of this iteration
+            segment = tuple(range(start_i, start_i + segment_len))
+            traj_segments.append(segment)
+            start_i += segment_len - overlap
+        del overlap
+
+        # store each segment
+        goal_xy = target_xy.copy()
+        for segment in traj_segments:  # repeat multiple times
+            xy_segment = planned_xy[segment, :]
+            grid_action_segment = planned_actions[segment[:-1],]
+
+            # dummy yaw and action
+            yaw_segment = np.ones((segment_len, 1), np.float32) * -1
+            action_segment = np.ones((segment_len - 1, 1), np.int32) * -1
+
+            # tfrecord features
+            context_features = {
+                'true_map': tf_bytes_feature(true_map_png),
+                'pred_map': tf_bytes_feature(pred_map_png),
+                'trajlen': tf_int64_feature(len(segment)),
+                'goal_xy': tf_bytes_feature(goal_xy.astype(np.float32).tobytes()),
+                'xy': tf_bytes_feature(xy_segment.astype(np.float32).tobytes()),
+                'yaw': tf_bytes_feature(yaw_segment.astype(np.float32).tobytes()),
+                'action': tf_bytes_feature(action_segment.astype(np.int32).tobytes()),
+                # 'grid_q_values': tf_bytelist_feature(q_segment.tobytes()),
+                'grid_action': tf_bytes_feature(grid_action_segment.astype(np.int32).tobytes()),
+            }
+            sequence_features = {
+                # 'local_map': tf.train.FeatureList(feature=[tf.train.Feature(bytes_list=tf.train.BytesList(value=[local_map_pngs[i]])) for i in segment]),
+                # 'visibility': tf.train.FeatureList(feature=[tf.train.Feature(bytes_list=tf.train.BytesList(value=[visibility_map_pngs[i]])) for i in segment]),
+            }
+
+            # store
+            example = tf.train.SequenceExample(context=tf.train.Features(feature=context_features),
+                                               feature_lists=tf.train.FeatureLists(feature_list=sequence_features))
+            tfwriter.write(example.SerializeToString())
+            self.num_data_entries += 1
+
+    def get_global_map_for_planning(self, global_map_pred, global_map_label, traj_xy, traj_yaw, map_shape, map_source, keep_soft):
+        if map_source in ['true', 'true-saved']:
             assert global_map_label.ndim == 3
             global_map_for_planning = global_map_label.copy()
-            # global_map_pred = global_map_for_planning.copy()  # TODO remove this and always predict
-            # global_map_true_partial = None
-            # local_map_label = None
             assert global_map_for_planning.shape == map_shape
+
+        elif map_source in ['true-partial']:
+            global_map_for_planning = global_map_label.copy()
+            # Overwrite unseen areas with 0.5
+            unseen_mask = np.isclose(global_map_pred, 0.5)
+            global_map_for_planning[unseen_mask] = 0.5
 
         else:
             global_map_for_planning = global_map_pred.copy()
@@ -1202,8 +1436,8 @@ class DSLAMAgent(habitat.Agent):
 
         if CLEAR_TARGET_RADIUS > 0:
             try:
-                min_xy = self.target_xy.astype(np.int32) - CLEAR_TARGET_RADIUS
-                max_xy = self.target_xy.astype(np.int32) + CLEAR_TARGET_RADIUS + 1
+                min_xy = self.target_xy_for_planning.astype(np.int32) - CLEAR_TARGET_RADIUS
+                max_xy = self.target_xy_for_planning.astype(np.int32) + CLEAR_TARGET_RADIUS + 1
 
                 global_map_for_planning[min_xy[0]:max_xy[0], min_xy[1]:max_xy[1]] = 1.
             except Exception as e:
@@ -1214,12 +1448,37 @@ class DSLAMAgent(habitat.Agent):
         #     print ("DEBUG !!!!!!! REMOVE !!!!!!!")
         #     self.collision_timesteps.append(1)
         # threshold
-        if not self.params.soft_cost_map:
+        if not keep_soft:
             traversable_threshold = self.params.traversable_threshold  # higher than this is traversable
             object_treshold = 0.  # treat everything as non-object
             threshold_const = np.array((traversable_threshold, object_treshold))[None, None, :self.map_ch - 1]
             global_map_for_planning = np.array(global_map_for_planning >= threshold_const, np.float32)
         return global_map_for_planning
+
+    @staticmethod
+    def shrink_map(xy, target_xy, global_map, margin=8):
+        assert margin > 6  # one step in each direction requires at least 6 margin
+        assert global_map.dtype == np.uint8
+
+        free_i, free_j, _  = np.nonzero(global_map == 0)
+        min_i = min(int(xy[0]), int(target_xy[0]), np.min(free_i)) - margin
+        min_j = min(int(xy[1]), int(target_xy[1]), np.min(free_j)) - margin
+        max_i = max(int(xy[0]), int(target_xy[0]), np.max(free_i)) + margin + 1
+        max_j = max(int(xy[1]), int(target_xy[1]), np.max(free_j)) + margin + 1
+
+        min_i = max(min_i, 0)
+        min_j = max(min_j, 0)
+        max_i = min(max_i, global_map.shape[0])
+        max_j = min(max_j, global_map.shape[1])
+
+        offset_xy = np.array([min_i, min_j], np.float32)
+
+        if min_i > 0 or min_j > 0 or max_i < global_map.shape[0] or max_j < global_map.shape[1]:
+            global_map = global_map[min_i:max_i, min_j:max_j]
+            xy = xy - offset_xy
+            target_xy = target_xy - offset_xy
+
+        return xy, target_xy, global_map, offset_xy
 
     @staticmethod
     def patch_map_with_collisions(global_map_for_planning, traj_xy, traj_yaw, collision_timesteps, patch_radius):
@@ -1235,10 +1494,15 @@ class DSLAMAgent(habitat.Agent):
                     indexing='ij')
                 ego_xy = np.stack((ego_x.flatten(), ego_y.flatten()), axis=-1)
                 abs_xy = xy[None] + rotate_2d(ego_xy, yaw[None])
-                abs_ij = np.clip(abs_xy.astype(np.int32), a_min=np.array((0, 0))[None], a_max=np.array(global_map_for_planning.shape[:2])[None]-1)
+                abs_ij = abs_xy.astype(np.int32)
             else:
                 abs_ij = xy[None].astype(np.int32)
-            global_map_for_planning[abs_ij[:, 0], abs_ij[:, 1]] = 0.  # not traversable
+            # Filter out of range
+            abs_ij = abs_ij[np.logical_and.reduce([
+                abs_ij[:, 0] >= 0, abs_ij[:, 1] >= 0, abs_ij[:, 0] < global_map_for_planning.shape[0],
+                abs_ij[:, 1] < global_map_for_planning.shape[1] ])]
+            # Set map not traversable (0.)
+            global_map_for_planning[abs_ij[:, 0], abs_ij[:, 1]] = 0.
         return global_map_for_planning
 
     def pose_error(self, slam_xy, slam_yaw, true_xy, true_yaw):
@@ -1258,7 +1522,7 @@ class DSLAMAgent(habitat.Agent):
             ind = min(frame_i // VIDEO_FRAME_SKIP, len(self.frame_traj_data)-1)
             self.video_image_ax.set_data(self.frame_traj_data[ind]['rgb'])
             self.video_text_ax1.set_text(self.frame_traj_data[ind]['target_status'])
-            split_str = self.frame_traj_data[ind]['control_status']
+            split_str = self.frame_traj_data[ind]['control_status'] + " " + self.frame_traj_data[ind]['act_status']
             # Attempt to break lines
             segs = split_str.split("[")
             if len(segs) > 1:
@@ -1322,7 +1586,7 @@ class DSLAMAgent(habitat.Agent):
                 self.video_global_map_ax.set_data(combined_map)
                 self.video_global_map_ax.set_extent([-0.5, combined_map.shape[1]-0.5, combined_map.shape[0]-0.5, -0.5])
                 self.video_path_scatter.set_offsets(np.flip(path_crop[planned_path_skip::planned_path_skip], axis=-1))
-                self.video_target_scatter.set_offsets([np.flip(path_crop[-1], axis=-1)])
+                self.video_target_scatter.set_offsets([np.flip(target_xy_crop, axis=-1)])
 
                 if VIDEO_LARGE_PLOT:
                     self.video_ax2.set_xlim(-0.5, combined_map2.shape[1]-0.5)
@@ -1330,14 +1594,14 @@ class DSLAMAgent(habitat.Agent):
                     self.video_global_map_ax2.set_data(combined_map2)
                     self.video_global_map_ax2.set_extent([-0.5, combined_map2.shape[1]-0.5, combined_map2.shape[0]-0.5, -0.5])
                     self.video_path_scatter2.set_offsets(np.flip(path[planned_path_skip::planned_path_skip], axis=-1))
-                    self.video_target_scatter2.set_offsets([np.flip(path[-1], axis=-1)])
+                    self.video_target_scatter2.set_offsets([np.flip(target_xy, axis=-1)])
 
                     self.video_ax3.set_xlim(-0.5, combined_map3.shape[1]-0.5)
                     self.video_ax3.set_ylim(combined_map3.shape[0]-0.5, -0.5)
                     self.video_global_map_ax3.set_data(combined_map3)
                     self.video_global_map_ax3.set_extent([-0.5, combined_map3.shape[1]-0.5, combined_map3.shape[0]-0.5, -0.5])
                     self.video_path_scatter3.set_offsets(np.flip(path[planned_path_skip::planned_path_skip], axis=-1))
-                    self.video_target_scatter3.set_offsets([np.flip(path[-1], axis=-1)])
+                    self.video_target_scatter3.set_offsets([np.flip(target_xy, axis=-1)])
 
                 # # View angle
                 # half_fov = 0.5 * np.deg2rad(70)
@@ -1364,8 +1628,6 @@ class DSLAMAgent(habitat.Agent):
                 # # Target
                 # xy = path[-1]
                 # self.video_path_circles[-1].center = ([xy[1], xy[0]])
-
-
 
             # self.video_text_ax2.set_data(self.summary_str)
         return self.video_image_ax
@@ -1454,12 +1716,12 @@ class DSLAMAgent(habitat.Agent):
                 #     self.video_view_angle_lines.extend(ax.plot([0., 1.], [0., 1.], '-', color='blue'))  # plot returns a list of lines
 
 
-                self.video_text_ax0 = fig.text(0.04, 0.9, self.summary_str, transform=fig.transFigure, fontsize=10,
+                self.video_text_ax0 = fig.text(0.04, 0.9, self.summary_str, transform=fig.transFigure, fontsize=9,
                                                verticalalignment='top')  # bottom left
 
-                self.video_text_ax1 = fig.text(0.96, 0.9, "Target", transform=fig.transFigure, fontsize=10,
+                self.video_text_ax1 = fig.text(0.96, 0.9, "Target", transform=fig.transFigure, fontsize=9,
                                                verticalalignment='top', horizontalalignment='right')
-                self.video_text_ax2 = fig.text(0.04, 0.05, "Status2", transform=fig.transFigure, fontsize=10,
+                self.video_text_ax2 = fig.text(0.04, 0.05, "Status2", transform=fig.transFigure, fontsize=9,
                                                verticalalignment='bottom', wrap=True)
 
             # im.set_clim([0, 1])
