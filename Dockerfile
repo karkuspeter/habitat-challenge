@@ -26,7 +26,7 @@ ENV CHALLENGE_CONFIG_FILE $TRACK_CONFIG_FILE
 
 COPY *.py /
 COPY *.sh /
-COPY *.conf /
+COPY configs /configs
 COPY data/habitat /data/habitat
 COPY build/mclnet /mclnet
 
