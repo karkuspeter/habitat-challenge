@@ -21,16 +21,19 @@ def get_floor_from_file(sceen_id, height):
     return get_floor(height, floor_heights)
 
 
-def load_map_from_file(scene_id, height=None, floor=None):
+def load_map_from_file(scene_id, height=None, floor=None, map_name="map"):
+    base_path = './data/habitat/maps/'
+
     if floor is None:
         assert height is not None
-        base_path = './data/habitat/maps/'
         floor_filename = base_path + '%s_floors.json' % scene_id
         with open(floor_filename, 'r') as file:
             floor_heights = json.load(file)['floor_heights']
         floor = get_floor(height, floor_heights)
 
-    map_filename = base_path + scene_id + '_%d_map.png' % floor
+    map_filename = base_path + scene_id + '_%d_%s.png' % (floor, map_name)
+    print (map_filename)
+
     global_map = cv2.imread(map_filename, cv2.IMREAD_UNCHANGED)
     if global_map is None:
         raise ValueError('Image could not be loaded from %s' % map_filename)

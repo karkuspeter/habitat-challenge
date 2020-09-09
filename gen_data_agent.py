@@ -3,7 +3,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-
+import argparse
 import os
 
 import numpy as np
@@ -17,9 +17,10 @@ import json
 import time
 import tensorflow as tf
 import tqdm
-from tfrecordfeatures import tf_bytelist_feature, tf_bytes_feature, tf_int64_feature
+from utils.tfrecordfeatures import tf_bytelist_feature, tf_bytes_feature, tf_int64_feature
 
 from habitat_utils import get_all_floors_from_file, get_floor
+from lmap.utils.map.generator import HabitatMaps
 
 cv2 = try_cv2_import()
 
@@ -92,7 +93,7 @@ def encode_image_to_string(image):
     return cv2.imencode(".png", image)[1].tostring()
 
 
-def generate_maps():
+def generate_maps(method="mesh", split="val"):  # mesh or sampling
     # config = habitat.get_config(config_paths="configs/tasks/pointnav.yaml")
     config = habitat.get_config(
         "./configs/challenge_modified.yaml",
@@ -108,6 +109,7 @@ def generate_maps():
     map_size = (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / grid_cell_size
     config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION = int(map_size)
     config.TASK.SENSORS.append("HEADING_SENSOR")
+    config.DATASET.SPLIT = split
     config.freeze()
     with SimpleRLEnv(config=config) as env:
         # goal_radius = env.episodes[0].goals[0].radius
@@ -121,7 +123,7 @@ def generate_maps():
         episode_iterator = env.habitat_env.episode_iterator
 
         print("Collecting episodes..")
-        for episode_i in range(min(5000, len(env.habitat_env.episodes))):
+        for episode_i in range(min(80000, len(env.habitat_env.episodes))):
             ep = next(episode_iterator)
             height = ep.start_position[1]
 
@@ -129,14 +131,18 @@ def generate_maps():
             scene_id = scene_id.split('/')[-1]
             scene_id = scene_id.split('.')[0]
             if scene_id not in floors_for_scene.keys():
-                floor_heights = get_all_floors_from_file(scene_id)
+                floor_filename = './data/habitat/maps/%s_floors.json'%scene_id
+                if os.path.isfile(floor_filename):
+                    with open(floor_filename, 'r') as file:
+                        floor_heights = json.load(file)['floor_heights']
+                else:
+                    floor_heights = get_all_floors_from_file(scene_id)
+                    with open(floor_filename, 'w') as file:
+                        json.dump({'floor_heights': floor_heights}, file, indent=4)
                 floors_for_scene[scene_id] = floor_heights
-                floor_filename = './maps/%s_floors.json'%scene_id
-                with open(floor_filename, 'w') as file:
-                    json.dump({'floor_heights': floor_heights}, file, indent=4)
             floor = get_floor(height, floors_for_scene[scene_id])
 
-            map_filename = './maps/' + scene_id + '_%d_map.png'%floor
+            map_filename = './data/habitat/maps/' + scene_id + '_%d_map.png'%floor
             if map_filename not in saved_maps:
                 saved_maps.append(map_filename)
                 episodes.append(ep)
@@ -151,19 +157,73 @@ def generate_maps():
             assert env.current_episode == episode
 
             observations, reward, done, info = env.step(2)  # turn right
-            height = env.habitat_env.sim.get_agent_state().position[1]
+            agent_pos = env.habitat_env.sim.get_agent_state().position
+            height = agent_pos[1]
 
             scene_id = env.current_episode.scene_id
             scene_id = scene_id.split('/')[-1]
             scene_id = scene_id.split('.')[0]
             floor = get_floor(height, floors_for_scene[scene_id])
-            map_filename = './maps/' + scene_id + '_%d_map.png'%floor
 
-            # Save map
+            # Obtain map
             global_map = info['top_down_map']['map']
             global_map = (global_map > 0).astype(np.uint8) * 255
+            map_filename = './temp/maps/' + scene_id + '_%d_map.png'%floor
             cv2.imwrite(map_filename, global_map)
             print ('Saved %s'%map_filename)
+
+            if method == "mesh":
+                pass
+            elif method in ["sampling", "hr_sampling"]:
+                # recover unknown offset position of the map in the agent pose coordinate frame
+                xy_from_map = np.array(info['top_down_map']['agent_map_coord'])  # x: downwards; y: rightwars
+                pos_from_map = maps.from_grid(xy_from_map[0], xy_from_map[1], maps.COORDINATE_MIN, maps.COORDINATE_MAX, (config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION, config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION))
+                pos = np.array((agent_pos[0], agent_pos[2]))
+                pos_offset = pos_from_map - pos
+
+                # find bounding box
+                pos_topleft = maps.from_grid(0, 0, maps.COORDINATE_MIN, maps.COORDINATE_MAX, (config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION, config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION))
+                pos_bottomright = maps.from_grid(global_map.shape[0]-1, global_map.shape[1]-1, maps.COORDINATE_MIN, maps.COORDINATE_MAX, (config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION, config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION))
+                pos_topleft = pos_topleft - pos_offset
+                pos_bottomright = pos_bottomright - pos_offset
+
+                # Sampling based mapper works in a coordinate system that is transposed and mirrored.
+                # So topleft corner of the map is equivalent to the left-bottom of our map
+                origin_left_bottom = np.array((pos_topleft[1], pos_bottomright[0])) * 100.
+                if method == "sampling":
+                    mapgen = HabitatMaps(env.habitat_env, int(1e7), resolution=5, padding=False, get_shortest_paths=False,
+                                         origin=tuple(origin_left_bottom),
+                                         map_size=(global_map.shape[1], global_map.shape[0]))
+                    sampled_map = mapgen.get_map(height * 100., -50., 50.)
+                    sampled_map = (sampled_map > 0).astype(np.uint8) * 255
+                    sampled_map = sampled_map[::-1, :]
+                    map_filename = './temp/maps/' + scene_id + '_%d_sampledmap.png' % floor
+
+                else:
+                    # high resolution sampling
+                    mapgen = HabitatMaps(env.habitat_env, int(5e7), resolution=1, padding=False, get_shortest_paths=False,
+                                         origin=tuple(origin_left_bottom),
+                                         map_size=(global_map.shape[1] * 5, global_map.shape[0] * 5))
+                    sampled_map = mapgen.get_map(height * 100., -50., 50.)
+                    sampled_map = (sampled_map > 0).astype(np.uint8) * 255
+                    sampled_map = sampled_map[::-1, :]
+
+                    sampled_map = sampled_map.reshape((global_map.shape[0], 5, global_map.shape[1], 5))
+                    sampled_map = sampled_map.min(axis=(1, 3))
+
+                    map_filename = './temp/maps/' + scene_id + '_%d_hrsampledmap.png' % floor
+
+                cv2.imwrite(map_filename, sampled_map)
+                print('Saved %s' % map_filename)
+                print ('Shapes: %s %s'%(str(global_map.shape), str(sampled_map.shape)))
+
+                # cv2.imwrite('./temp/temp1.png', global_map)
+                # cv2.imwrite('./temp/temp2.png', sampled_map)
+                # import ipdb as pdb
+                # pdb.set_trace()
+
+            else:
+                raise ValueError("method should be mesh or sampling")
 
         # print("Environment creation successful")
         # for episode in range(10000):
@@ -475,10 +535,20 @@ def generate_scenarios(output_filename=None, num_episodes=50000, skip_first_n=0,
 
 
 def main(*args):
-    # generate_maps()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--maps", default="false", choices=["true", "false"],)
+    parser.add_argument("--map_method", default="mesh", choices=["mesh", "sampling", "hr_sampling"],)
+    parser.add_argument("--num_episodes", type=int, default=0)
+    parser.add_argument("--split", default="val", type=str, choices=["train", "val"])
+    args = parser.parse_args()
+    args.maps = (args.maps == "true")
+
+    if args.maps:
+        generate_maps(method=args.map_method, split=args.split)
+        return
 
     # Figured from maps folder. Training set: 72 scenes. Test set: 14 scenes.
-    split = 'train'
+    split = args.split
     episodes_per_scene = 50
     spinning = False
     mix_random_policy = True
@@ -493,12 +563,7 @@ def main(*args):
         skip_first_n = 0
     else:
         raise ValueError()
-
-
-    # ---------
-
-    if len(args) >= 2 and args[0] == '--num_episodes':
-        num_episodes = args[1]
+    num_episodes = num_episodes if args.num_episodes <= 0 else args.num_episodes
 
     # Spinning
     if spinning:

@@ -1,0 +1,3 @@
+[submodule "latentmapping"]
+	path = latentmapping
+	url = https://github.com/karkuspeter/latentmapping.git
