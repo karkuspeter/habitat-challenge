@@ -22,7 +22,7 @@ import tensorflow as tf
 
 from train import get_brain, get_tf_config
 from common_net import load_from_file, count_number_trainable_params
-from visualize_mapping import plot_viewpoints, plot_target_and_path, mapping_visualizer
+from visualize.visualize_habitat_training import plot_viewpoints, plot_target_and_path, mapping_visualizer
 from gen_habitat_data import actions_from_trajectory
 from gen_planner_data import rotate_map_and_poses, Transform2D
 
@@ -35,7 +35,7 @@ except:
     import pdb
 
 
-ACTION_SOURCE = "plan"  #"expert"  # "plan"  # "expert"  # expert
+ACTION_SOURCE = "plan"  #"expert"  # "plan"
 START_WITH_SPIN = True
 SPIN_TARGET = np.deg2rad(370)  # np.deg2rad(270)  # np.deg2rad(360 - 70)
 SPIN_DIRECTION = 1   # 1 for same direction as target, -1 for opposite direction. Opposite is better if target < 360
@@ -63,13 +63,13 @@ SUPRESS_EXCEPTIONS = False
 # GIVE_UP_NUM_COLLISIONS = 8  # 100 # TODO increase TODO increase later distances
 # GIVE_UP_STEP_AND_DISTANCE = [[0, 440], [150, 320], [300, 250], [400, 150]]   # NOTE if changing first threshold also change max map size.
 # GIVE_UP_TIME_AND_REDUCTION = [[10., 100], [15., 120], [20., 300], [30., 400]]   # in minutes ! and  distance reduction from beginning
-
-# # Almost never give up -- august submission
+#
+# # Almost never give up -- august submission4
 # GIVE_UP_NO_PROGRESS_STEPS = 100
 # NO_PROGRESS_THRESHOLD = 12
-# GIVE_UP_NUM_COLLISIONS = 25
-# GIVE_UP_STEP_AND_DISTANCE = [[0, 440], [150, 320], [300, 250], [400, 150]]   # NOTE if changing first threshold also change max map size.
-# GIVE_UP_TIME_AND_REDUCTION = [[10., 100], [15., 120], [20., 300], [30., 400]]   # in minutes ! and  distance reduction from beginning
+# GIVE_UP_NUM_COLLISIONS = 20
+# GIVE_UP_STEP_AND_DISTANCE = [[0, 440], [150, 300], [200, 250], [250, 200], [300, 150], [350, 100], [400, 40]]   # NOTE if changing first threshold also change max map size.
+# GIVE_UP_TIME_AND_REDUCTION = []  #[10., 100], [15., 120], [20., 300], [30., 400]]   # in minutes ! and  distance reduction from beginning
 
 # # no giveup but 300 limit for data generation
 # GIVE_UP_NO_PROGRESS_STEPS = 1000
@@ -112,15 +112,16 @@ EXTRA_STEPS_WHEN_EXPANDING_MAP = 30
 
 # !!!!!!
 PLOT_EVERY_N_STEP = -1
-USE_ASSERTS = True
+USE_ASSERTS = False
 # 42 * 60 * 60 - 3 * 60 * 60   #  30 * 60 - 5 * 60  #
-TOTAL_TIME_LIMIT =  42 * 60 * 60 - 90 * 60   # challenge gave up at 38h and finished at 39h so 90 minutes should be enough
+TOTAL_TIME_LIMIT = 42 * 60 * 60 - 120 * 60   # challenge gave up at 38h and finished at 39h so 120 minutes should be enough
 # 42 hours = 2520 mins for 1000-2000 episodes.
 # Average episode time should be < 75.6 sec
 ERROR_ON_TIMEOUT = False   #  True
 SKIP_FIRST_N_FOR_TEST = -1  # 10  # 10  # 10
 VIDEO_FRAME_SKIP = 6
 VIDEO_LARGE_PLOT = False
+DEBUG_DUMMY_ACTIONS_ONLY = False
 # !!!!!!!
 
 REPLACE_WITH_RANDOM_ACTIONS = False
@@ -129,8 +130,11 @@ FAKE_INPUT_FOR_SPEED_TEST = False
 MAX_MAP_SIZE_FOR_SPEED_TEST = False
 
 # DATA GENERATION
+SAVE_DATA_EVERY_N = 4
+DATA_FIRST_STEP_ONLY = True
+DATA_MAX_TRAJLEN = 50
 DATA_INCLUDE_NONPLANNED_ACTIONS = False
-
+DATA_USE_LAST_SEGMENT = False  # when map is smaller use either the last or the first trajectory segment
 
 
 class DSLAMAgent(habitat.Agent):
@@ -169,7 +173,7 @@ class DSLAMAgent(habitat.Agent):
         self.confidence_threshold = None  # (0.2, 0.01)  # (0.35, 0.05)
         self.use_custom_visibility = (self.params.visibility_mask in [2, 20, 21])
 
-        assert self.params.agent_map_source in ['true', 'true-saved', 'true-partial', 'pred']
+        assert self.params.agent_map_source in ['true', 'true-saved', 'true-saved-sampled', 'true-saved-hrsampled', 'true-partial', 'pred']
         assert self.params.agent_pose_source in ['slam', 'slam-truestart', 'true']
 
         _, gpuname = get_tf_config(devices=params.gpu)  # sets CUDA_VISIBLE_DEVICES
@@ -396,6 +400,7 @@ class DSLAMAgent(habitat.Agent):
         self.summary_str = ""
         self.filename_addition = ""
         self.logdir = logdir
+        self.saved_map_i = 0
 
         self.reset()
 
@@ -457,7 +462,7 @@ class DSLAMAgent(habitat.Agent):
 
             action = (2 if self.spin_direction > 0 else 3)
             planned_path = np.zeros((0, 2))
-            return action, planned_path, status_message, (global_map_pred * 255.).astype(np.uint8)
+            return action, planned_path, status_message, (global_map_pred * 255.).astype(np.uint8), None
 
         if not self.params.soft_cost_map:
             assert global_map_pred.dtype == np.float32
@@ -546,7 +551,7 @@ class DSLAMAgent(habitat.Agent):
         if allow_shrink_map:
             planned_path = planned_path + offset_xy[None]
 
-        return action, planned_path, status_message, eroded_scan_map
+        return action, planned_path, status_message, eroded_scan_map, offset_xy
 
     def act(self, observations):
         if SUPRESS_EXCEPTIONS:
@@ -640,8 +645,9 @@ class DSLAMAgent(habitat.Agent):
                         # assert False
                     self.map_mismatch_count += new_map_mismatch_count
                 true_global_map = self.last_true_global_map  # keep the first
-            elif self.map_source == 'true-saved':
-                saved_global_map = load_map_from_file(scene_id=self.get_scene_name(), height=agent_pos[1])
+            elif self.map_source in ['true-saved', 'true-saved-sampled', 'true-saved-hrsampled']:
+                saved_global_map = load_map_from_file(scene_id=self.get_scene_name(), height=agent_pos[1], map_name=(
+                    "map" if self.map_source == 'true-saved' else ('sampledmap' if self.map_source == 'true-saved-sampled' else 'hrsampledmap')))
                 assert saved_global_map.dtype == np.uint8
                 assert saved_global_map.shape == true_global_map.shape
                 self.map_mismatch_count  = np.count_nonzero(np.logical_and(saved_global_map, true_global_map))
@@ -1172,6 +1178,7 @@ class DSLAMAgent(habitat.Agent):
         # Choose which map to use for planning
         global_map_for_planning = self.get_global_map_for_planning(global_map_pred, global_map_label, traj_xy, traj_yaw, map_shape, self.map_source, keep_soft=self.params.soft_cost_map)
         processed_map_for_planning = global_map_for_planning
+        shrunk_map_offset_xy = None
         if MANUAL_STOP_WHEN_NEAR_TARGET and target_dist < 3.:
             # Close enough to target. Normal requirement is 0.36/0.05 = 7.2
             plan_status_msg = "Manual stop"
@@ -1209,7 +1216,7 @@ class DSLAMAgent(habitat.Agent):
             action = 0
 
         else:
-            action, planned_path, plan_status_msg, processed_map_for_planning = self.plan_and_control(
+            action, planned_path, plan_status_msg, processed_map_for_planning, shrunk_map_offset_xy = self.plan_and_control(
                 xy, yaw, self.target_xy_for_planning, global_map_for_planning, ang_vel, initial_target_fi,
                 allow_shrink_map=self.fixed_map_size and ALLOW_SHRINK_MAP)
             is_done = (action == 0)
@@ -1235,18 +1242,21 @@ class DSLAMAgent(habitat.Agent):
                 print ("Sping instead of stopping.")
                 action = 3
             is_done = (action == 0)
+        if DEBUG_DUMMY_ACTIONS_ONLY:
+            action = 1
 
         # Save data
-        if len(self.tfwriters) > 0:
+        if len(self.tfwriters) > 0 and self.step_i % SAVE_DATA_EVERY_N == 0:
             if planned_path.shape[0] == 0 or target_dist < 10.5:  # two step strategy for <= 10
                 if DATA_INCLUDE_NONPLANNED_ACTIONS:
                     raise NotImplementedError
             else:
                 assert self.map_source != "pred"
                 pred_map_for_planning = self.get_global_map_for_planning(global_map_pred, global_map_label, traj_xy,
-                                                                           traj_yaw, map_shape, "pred", keep_soft=True)
+                                                                         traj_yaw, map_shape, "pred", keep_soft=True)
 
-                self.write_datapoint(global_map_for_planning, pred_map_for_planning, self.target_xy_for_planning, planned_path.astype(np.int32), action)
+                self.write_datapoint(global_map_for_planning, pred_map_for_planning, self.target_xy_for_planning,
+                                     planned_path.astype(np.int32), action, shrunk_map_offset_xy)
 
         # pdb.set_trace()
         # if self.episode_i == 0:
@@ -1303,7 +1313,7 @@ class DSLAMAgent(habitat.Agent):
                 'giveup_distance': float(giving_up_distance), 'is_done: ': is_done}   # 0: stop, forward, left, right
         # return {"action": numpy.random.choice(self._POSSIBLE_ACTIONS)}
 
-    def write_datapoint(self, map_for_planning, pred_map, target_xy, planned_path, action):
+    def write_datapoint(self, map_for_planning, pred_map, target_xy, planned_path, action, shrunk_map_offset_xy):
         assert planned_path.shape[0] > 0
         assert planned_path.dtype == np.int32
         planned_actions = grid_actions_from_trajectory(planned_path, connect8=False)
@@ -1323,23 +1333,49 @@ class DSLAMAgent(habitat.Agent):
         map_for_planning = (map_for_planning * 255.).astype(np.uint8)
         pred_map = (pred_map * 255.).astype(np.uint8)  # encode predicted probability as uint8
 
+        if np.any(map_for_planning[planned_path[:, 0], planned_path[:, 1]] < 127):
+            print ("Skip because path is not collision free")
+            return
+
+        # Q values. Assumes planner is a VI and it was called in this time step, otherwise path would be None
+        qs = self.pathplanner.last_qs_value
+        if shrunk_map_offset_xy is not None:
+            shrunk_map_offset_xy = shrunk_map_offset_xy.astype(np.int)
+            qs = np.pad(qs, [[shrunk_map_offset_xy[0], pred_map.shape[0]-qs.shape[0]-shrunk_map_offset_xy[0]],
+                             [shrunk_map_offset_xy[1], pred_map.shape[1]-qs.shape[1]-shrunk_map_offset_xy[1]],
+                             [0, 0]])
+        assert qs.shape[:2] == pred_map.shape[:2]
+
         assert len(self.tfwriters) == len(self.params.data_map_sizes)
         for tfwriter, map_size in zip(self.tfwriters, self.params.data_map_sizes):
+            self.write_data_for_map_size(map_for_planning, pred_map, qs, planned_actions, planned_path, target_xy, tfwriter, map_size)
+        self.saved_map_i += 1
 
-            self.write_data_for_map_size(map_for_planning, pred_map, planned_actions, planned_path, target_xy, tfwriter, map_size)
-
-    def write_data_for_map_size(self, map_for_planning, pred_map, planned_actions, planned_path, target_xy, tfwriter, map_size):
+    def write_data_for_map_size(self, map_for_planning, pred_map, qs, planned_actions, planned_path, target_xy, tfwriter, map_size):
         segment_len = self.params.trainlen
 
         if map_size < map_for_planning.shape[0]:
-            # Find last trajectory segment that is still within the map size
-            margin = 2
-            for start_i in range(len(planned_path)):
-                range_ij = np.max(planned_path[start_i:], axis=0) - np.min(planned_path[start_i:], axis=0)
-                if np.all(range_ij < map_size - 2 * margin):
-                    break
-            planned_path = planned_path[start_i:]
-            planned_actions = planned_actions[start_i:]
+            assert False  # We need to replan for q values to be valid.
+
+            if DATA_USE_LAST_SEGMENT:
+                # Find last trajectory segment that is still within the map size
+                margin = 2
+                for start_i in range(len(planned_path)):
+                    range_ij = np.max(planned_path[start_i:], axis=0) - np.min(planned_path[start_i:], axis=0)
+                    if np.all(range_ij < map_size - 2 * margin):
+                        break
+                planned_path = planned_path[start_i:]
+                planned_actions = planned_actions[start_i:]
+            else:
+                # Find first trajectory segment that is within the map size and change goal
+                margin = 2
+                for end_i in range(len(planned_path), 0, -1):  # go backwards
+                    range_ij = np.max(planned_path[:end_i], axis=0) - np.min(planned_path[:end_i], axis=0)
+                    if np.all(range_ij < map_size - 2 * margin):
+                        break
+                planned_path = planned_path[:end_i]
+                planned_actions = planned_actions[:end_i]
+                target_xy = planned_path[-1].astype(np.float32) + 0.5
 
             # Crop map
             offset_ij = np.min(planned_path, axis=0)
@@ -1352,6 +1388,8 @@ class DSLAMAgent(habitat.Agent):
             # crop the given size starting from offset_ij
             map_for_planning = map_for_planning[offset_ij[0]:offset_ij[0]+map_size, offset_ij[1]:offset_ij[1]+map_size]
             pred_map = pred_map[offset_ij[0]:offset_ij[0]+map_size, offset_ij[1]:offset_ij[1]+map_size]
+            qs = qs[offset_ij[0]:offset_ij[0]+map_size, offset_ij[1]:offset_ij[1]+map_size]
+            qs = qs.astype(np.float32)
 
             # Move poses to cropped frame
             planned_path = planned_path - offset_ij[None]
@@ -1362,6 +1400,20 @@ class DSLAMAgent(habitat.Agent):
         assert map_for_planning.shape[0] == map_size and map_for_planning.shape[1] == map_size
         assert np.all(planned_path >= 0) and np.all(planned_path < map_size)
 
+        # Limit trajlen so we only save the trajectory segment near the current pose
+        if DATA_FIRST_STEP_ONLY:
+            max_trajlen = segment_len  # there will be only one segment
+        else:
+            max_trajlen = DATA_MAX_TRAJLEN // segment_len * segment_len
+        assert max_trajlen >= 2
+        planned_path = planned_path[:max_trajlen]
+        planned_actions = planned_actions[:max_trajlen-1]
+
+        # Abstract Q values along trajectory and make sure they are consistent with the action choices
+        q_traj = qs[planned_path[:, 0].astype(np.int), planned_path[:, 1].astype(np.int), :]
+        q_for_actions = q_traj[np.arange(q_traj.shape[0]-1), planned_actions]
+        assert np.all(np.isclose(q_for_actions, q_traj[:-1].max(axis=1)))
+
         planned_xy = planned_path.astype(np.float32) + 0.5
 
         true_map_png = cv2.imencode('.png', map_for_planning)[1].tobytes()
@@ -1371,7 +1423,7 @@ class DSLAMAgent(habitat.Agent):
         overlap = 1  # use extra step because last action will be dropped
         assert overlap < segment_len
         start_i = 0
-        while start_i < planned_path.shape[0]:  # include all steps
+        while start_i < planned_path.shape[0] - overlap:  # include all steps
             # for incomplete last segment, start earlier overlapping with previous segment
             if start_i + segment_len > planned_path.shape[0]:
                 start_i = planned_path.shape[0] - segment_len
@@ -1380,12 +1432,14 @@ class DSLAMAgent(habitat.Agent):
             traj_segments.append(segment)
             start_i += segment_len - overlap
         del overlap
+        assert not DATA_FIRST_STEP_ONLY or len(traj_segments) == 1
 
         # store each segment
         goal_xy = target_xy.copy()
-        for segment in traj_segments:  # repeat multiple times
+        for segment_i, segment in enumerate(traj_segments):  # repeat multiple times
             xy_segment = planned_xy[segment, :]
             grid_action_segment = planned_actions[segment[:-1],]
+            q_segment = q_traj[segment[:-1],]
 
             # dummy yaw and action
             yaw_segment = np.ones((segment_len, 1), np.float32) * -1
@@ -1400,8 +1454,12 @@ class DSLAMAgent(habitat.Agent):
                 'xy': tf_bytes_feature(xy_segment.astype(np.float32).tobytes()),
                 'yaw': tf_bytes_feature(yaw_segment.astype(np.float32).tobytes()),
                 'action': tf_bytes_feature(action_segment.astype(np.int32).tobytes()),
-                # 'grid_q_values': tf_bytelist_feature(q_segment.tobytes()),
+                'grid_q_values': tf_bytes_feature(q_segment.astype(np.float32).tobytes()),
                 'grid_action': tf_bytes_feature(grid_action_segment.astype(np.int32).tobytes()),
+                'qs': tf_bytes_feature(qs.tobytes()),
+                'episode_id': tf_bytes_feature(np.array((self.episode_i + self.params.skip_first_n, ), np.int32).tobytes()),
+                'map_id': tf_bytes_feature(np.array((self.saved_map_i, ), np.int32).tobytes()),
+                'segment_i': tf_bytes_feature(np.array((segment_i, ), np.int32).tobytes()),
             }
             sequence_features = {
                 # 'local_map': tf.train.FeatureList(feature=[tf.train.Feature(bytes_list=tf.train.BytesList(value=[local_map_pngs[i]])) for i in segment]),
@@ -1415,7 +1473,7 @@ class DSLAMAgent(habitat.Agent):
             self.num_data_entries += 1
 
     def get_global_map_for_planning(self, global_map_pred, global_map_label, traj_xy, traj_yaw, map_shape, map_source, keep_soft):
-        if map_source in ['true', 'true-saved']:
+        if map_source in ['true', 'true-saved', 'true-saved-sampled', 'true-saved-hrsampled']:
             assert global_map_label.ndim == 3
             global_map_for_planning = global_map_label.copy()
             assert global_map_for_planning.shape == map_shape

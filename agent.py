@@ -14,6 +14,16 @@ import tensorflow as tf
 from arguments import parse_args
 
 
+# This is a hack attempt to address error "BrokenPipeError: [Errno 32] Broken pipe". My suspicion is that the
+# planner process can be alive (and write to stdout) even after all episodes are done. The output is possibly
+# redirected in the eval script, which creates a problem similar to this:
+# https://stackoverflow.com/questions/11423225/why-does-my-python3-script-balk-at-piping-its-output-to-head-or-tail-sys-module
+# The issue was discovered with ./test_locally_pointnav_rgbs.sh with an TIMEOUT of 1sec, where agent gives up all episdoes.
+# import signal
+# signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+# signal.signal(signal.SIG, signal.SIG_DFL)
+
+
 class RandomAgent(habitat.Agent):
     def __init__(self, task_config: habitat.Config, params=None):
         self._POSSIBLE_ACTIONS = task_config.TASK.POSSIBLE_ACTIONS
