@@ -19,7 +19,7 @@ import tensorflow as tf
 import tqdm
 from utils.tfrecordfeatures import tf_bytelist_feature, tf_bytes_feature, tf_int64_feature
 
-from habitat_utils import get_all_floors_from_file, get_floor
+from habitat_utils import get_all_floors_from_file, get_floor, encode_image_to_string, get_model_id_from_episode
 from lmap.utils.map.generator import HabitatMaps
 
 cv2 = try_cv2_import()
@@ -85,14 +85,6 @@ def draw_top_down_map(info, heading, output_size):
 #     return np.sort(floor_heights)
 
 
-
-def encode_image_to_string(image):
-    if image.dtype != np.uint8:
-        assert np.all(image <= 1.)
-        image = (image * 255).astype(np.uint8)
-    return cv2.imencode(".png", image)[1].tostring()
-
-
 def generate_maps(method="mesh", split="val"):  # mesh or sampling
     # config = habitat.get_config(config_paths="configs/tasks/pointnav.yaml")
     config = habitat.get_config(
@@ -122,6 +114,7 @@ def generate_maps(method="mesh", split="val"):  # mesh or sampling
         episodes = []
         episode_iterator = env.habitat_env.episode_iterator
 
+        print ("Total episodes for %s: %d"%(split, len(env.habitat_env.episodes)))
         print("Collecting episodes..")
         for episode_i in range(min(80000, len(env.habitat_env.episodes))):
             ep = next(episode_iterator)
@@ -311,9 +304,10 @@ def generate_maps(method="mesh", split="val"):  # mesh or sampling
 
 
 def generate_scenarios(output_filename=None, num_episodes=50000, skip_first_n=0,
-                       spin_every_forward_n=1000, spin_before_done=False, mix_random_policy=False, split='val', episodes_per_scene=50, write_lock=None):
+                       spin_every_forward_n=1000, spin_before_done=False, mix_random_policy=False, split='val',
+                       episodes_per_scene=50, write_lock=None, configfile="./configs/challenge_datagen.yaml"):
     # config = habitat.get_config(config_paths="configs/tasks/pointnav.yaml")
-    config = habitat.get_config("./configs/challenge_datagen.yaml",)
+    config = habitat.get_config(configfile,)
 
     floors_for_scene = {}
 
@@ -347,14 +341,18 @@ def generate_scenarios(output_filename=None, num_episodes=50000, skip_first_n=0,
         for episode_i in tqdm.tqdm(range(skip_first_n)):
             next(episode_iterator)
 
+        # for episode_i in range(200):
+        #     env.reset()
+        #     ep = env.habitat_env.current_episode
+        #     sceen_id = get_model_id_from_episode(ep)
+        #     print (episode_i, sceen_id)
+
         print("Generating %d episodes.."%num_episodes)
         for episode_i in tqdm.tqdm(range(num_episodes)):
             env.reset()
             ep = env.habitat_env.current_episode
             height = ep.start_position[1]
-            sceen_id = ep.scene_id
-            sceen_id = sceen_id.split('/')[-1]
-            sceen_id = sceen_id.split('.')[0]
+            sceen_id = get_model_id_from_episode(ep)
             if sceen_id not in floors_for_scene.keys():
                 floors_for_scene[sceen_id] = get_all_floors_from_file(sceen_id)
             floor = get_floor(height, floors_for_scene[sceen_id])
@@ -540,6 +538,7 @@ def main(*args):
     parser.add_argument("--map_method", default="mesh", choices=["mesh", "sampling", "hr_sampling"],)
     parser.add_argument("--num_episodes", type=int, default=0)
     parser.add_argument("--split", default="val", type=str, choices=["train", "val"])
+    parser.add_argument("--config", default="./configs/challenge_datagen.yaml", type=str)
     args = parser.parse_args()
     args.maps = (args.maps == "true")
 
@@ -547,9 +546,9 @@ def main(*args):
         generate_maps(method=args.map_method, split=args.split)
         return
 
-    # Figured from maps folder. Training set: 72 scenes. Test set: 14 scenes.
+    # Figured from maps folder. Training set: 72 scenes. Val set: 14 scenes.
     split = args.split
-    episodes_per_scene = 50
+    episodes_per_scene = 15
     spinning = False
     mix_random_policy = True
 
@@ -559,7 +558,7 @@ def main(*args):
         skip_first_n = 3600 # 0  # 14400
     elif split == 'val':
         # val
-        num_episodes = 15 * episodes_per_scene * 2  # ? test scenes. 100 per scene. Actually there are total 88, training less. Ended with Brevort.
+        num_episodes = 15 * episodes_per_scene * 2  # 15 val scenes.
         skip_first_n = 0
     else:
         raise ValueError()
@@ -578,7 +577,8 @@ def main(*args):
                        spin_before_done=spin_before_done,
                        mix_random_policy=mix_random_policy,
                        episodes_per_scene=episodes_per_scene,
-                       split=split)
+                       split=split,
+                       configfile=args.config)
 
 
 if __name__ == "__main__":
