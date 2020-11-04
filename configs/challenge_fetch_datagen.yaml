@@ -1,0 +1,88 @@
+BASE_TASK_CONFIG_PATH: "configs/challenge_pointnav2020.local.rgbd.yaml"
+ENVIRONMENT:
+  MAX_EPISODE_STEPS: 500
+  ITERATOR_OPTIONS:
+    CYCLE: False
+    GROUP_BY_SCENE: False
+    SHUFFLE: False
+    MAX_SCENE_REPEAT_EPISODES: 100
+
+SIMULATOR:
+  TURN_ANGLE: 30
+  AGENT_0:
+    SENSORS: ['RGB_SENSOR', 'DEPTH_SENSOR']
+    HEIGHT: 1.35  # 130cm camera height + 5cm   # 0.88.
+    RADIUS: 0.28  # 0.18
+  HABITAT_SIM_V0:
+    GPU_DEVICE_ID: 0
+    ALLOW_SLIDING: False
+
+  # RealSense D435. Same as on Locobot.
+  RGB_SENSOR:
+    WIDTH: 320
+    HEIGHT: 180
+    HFOV: 69.4  # 70
+    VFOV: 42.5
+    # Frame 0.170 0.038 1.480
+    POSITION: [0, 1.480, 0]   # test out which one is negative
+    ORIENTATION: [ -0.3848451, 0, 0 ]  # -20 degrees -> 22.05
+    NOISE_MODEL: "GaussianNoiseModel"
+    NOISE_MODEL_KWARGS:
+      intensity_constant: 0.1
+
+  DEPTH_SENSOR:
+    WIDTH: 320
+    HEIGHT: 180
+    HFOV: 86  # 70  # It is actually different according to specs!  TODO check if this is really true in practice.
+    VFOV: 57
+    MIN_DEPTH: 0.1
+    MAX_DEPTH: 10.0
+    # Frame: 0.17 0.023 1.480
+    POSITION: [0, 0.88, 0]
+    ORIENTATION: [ -0.38816123, 0, 0 ]  # -20 degrees -> 22.24
+    NOISE_MODEL: "RedwoodDepthNoiseModel"
+
+  # Fetch Head
+#  RGB_SENSOR:
+#    WIDTH: 640
+#    HEIGHT: 480
+#    HFOV: 57.5
+#    VFOV: 45.0
+#    #TODO height does not match specs!!
+#    # Pos z=0.15  but because of head angle, z=0.15 * cos(20) = 0.141  and  y = 1.30 + sin(20)*0.15 = 1.248
+#    POSITION: [0, 1.248, 0.141]  # which axis is forward? its probably the last, because of orientation axis
+#    ORIENTATION: [ -0.3490659, 0, 0 ]  # -20 degrees
+#    NOISE_MODEL: "GaussianNoiseModel"
+#    NOISE_MODEL_KWARGS:
+#      intensity_constant: 0.1
+#
+#  DEPTH_SENSOR:
+#    MIN_DEPTH: 0.35
+#    MAX_DEPTH: 1.40  # TODO really this short?  Can check returned image values
+#    POSITION: [0, 0.88, 0]
+#    NOISE_MODEL: "RedwoodDepthNoiseModel"
+
+  ACTION_SPACE_CONFIG: 'pyrobotnoisy'
+  NOISE_MODEL:
+    ROBOT: "LoCoBot"
+    CONTROLLER: 'Proportional'
+    NOISE_MULTIPLIER: 0.5
+
+TASK:
+  TYPE: Nav-v0
+  SUCCESS_DISTANCE: 0.36 # 2 x Agent Radius
+  SENSORS: ['POINTGOAL_SENSOR', 'HEADING_SENSOR', 'GPS_SENSOR']
+  POINTGOAL_SENSOR:
+    GOAL_FORMAT: POLAR
+    DIMENSIONALITY: 2
+  GOAL_SENSOR_UUID: pointgoal
+  MEASUREMENTS: ['DISTANCE_TO_GOAL', "SUCCESS", 'SPL']  #
+  SUCCESS:
+    SUCCESS_DISTANCE: 0.36 # 2 x Agent Radius
+
+DATASET:
+  TYPE: PointNav-v1
+  SPLIT: train  #val  # train
+  DATA_PATH: habitat-challenge-data/data/datasets/pointnav/gibson/v2/{split}/{split}.json.gz
+  # DATA_PATH: habitat-challenge-data/pointgoal_gibson_v2/{split}/{split}.json.gz
+  SCENES_DIR: "habitat-challenge-data/data/scene_datasets/"
