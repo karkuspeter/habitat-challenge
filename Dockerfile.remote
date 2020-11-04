@@ -3,9 +3,15 @@ FROM fairembodied/habitat-challenge:testing_2020_habitat_base_docker
 
 RUN /bin/bash -c ". activate habitat; pip install ipdb zmq flask networkx"
 
-RUN /bin/bash -c ". activate habitat; conda install tensorflow-gpu=1.14.0 tensorflow-probability==0.7.0 ffmpeg"
 #RUN /bin/bash -c ". activate habitat; pip install tensorflow-gpu==1.14 tensorpack configargparse socketIO-client"
-RUN /bin/bash -c ". activate habitat; pip install tensorpack configargparse socketIO-client"
+
+# # v1
+# RUN /bin/bash -c ". activate habitat; conda install tensorflow-gpu=1.14.0 tensorflow-probability==0.7.0 ffmpeg"
+# RUN /bin/bash -c ". activate habitat; pip install tensorpack configargparse socketIO-client"
+
+# # v2.
+RUN /bin/bash -c ". activate habitat; conda install ffmpeg cudatoolkit=10.0 cudnn=7.6.5=cuda10.0_0"
+RUN /bin/bash -c ". activate habitat; pip install tensorflow-gpu==1.14.0 tensorflow-probability==0.7.0 tensorpack configargparse socketIO-client"
 
 # RUN source activate habitat
 #RUN pip install ipdb zmq flask networkx

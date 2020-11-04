@@ -123,6 +123,23 @@ def main():
         map_size = (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / grid_cell_size
         assert config.TASK.TOP_DOWN_MAP.MAP_RESOLUTION == int(map_size)
 
+        # # TODO Try to add additional noiseless sensors. Changes here have no effect!! Modify config file instead.
+        # config.defrost()
+        # # config.SIMULATOR.AGENT_0.SENSORS.append("NOISELESS_RGB_SENSOR")
+        # # config.SIMULATOR.NOISELESS_RGB_SENSOR = habitat.Config(config.SIMULATOR.RGB_SENSOR)
+        # # config.SIMULATOR.NOISELESS_RGB_SENSOR.NOISE_MODEL = ""
+        # # config.SIMULATOR.NOISELESS_RGB_SENSOR.NOISE_MODEL_KWARGS = habitat.Config()
+        # # config.SIMULATOR.AGENT_0.SENSORS.append("NOISELESS_DEPTH_SENSOR")
+        # # config.SIMULATOR.NOISELESS_DEPTH_SENSOR = habitat.Config(config.SIMULATOR.DEPTH_SENSOR)
+        # # config.SIMULATOR.NOISELESS_DEPTH_SENSOR.NOISE_MODEL = ""
+        # # config.SIMULATOR.NOISELESS_DEPTH_SENSOR.NOISE_MODEL_KWARGS = habitat.Config()
+        # config.SIMULATOR.AGENT_0.SENSORS.append("NOISELESS_RGB_SENSOR")
+        # config.SIMULATOR.NOISELESS_RGB_SENSOR = habitat.Config(config.SIMULATOR.RGB_SENSOR)
+        # config.SIMULATOR.NOISELESS_RGB_SENSOR.TYPE = "SecondHabitatSimRGBSensor"
+        # config.SIMULATOR.NOISELESS_RGB_SENSOR.NOISE_MODEL = ""
+        # config.SIMULATOR.NOISELESS_RGB_SENSOR.NOISE_MODEL_KWARGS = habitat.Config()
+        # config.freeze()
+
         challenge = habitat.Challenge(eval_remote=False)
         env = challenge._env
 
@@ -166,6 +183,26 @@ def main():
         agent = DSLAMAgent(task_config=config, params=params, env=None, logdir=logdir)
         # agent = RandomAgent(task_config=config, params=params)
         challenge.submit(agent)
+
+
+# TODO we can add a second RGB sensor this way, but i have not implemented the logic to save to data and to load such data.
+# from habitat.sims.habitat_simulator import habitat_simulator
+# from typing import Any, List, Optional, Union
+#
+# # Define the sensor and register it with habitat
+# # For the sensor, we will register it with a custom name
+# @habitat.registry.register_sensor(name="SecondHabitatSimRGBSensor")
+# class SecondHabitatSimRGBSensor(habitat_simulator.HabitatSimRGBSensor):
+#     # Defines the name of the sensor in the sensor suite dictionary
+#     def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+#         return "rgb2"
+#
+#
+# @habitat.registry.register_sensor(name="SecondHabitatSimDepthSensor")
+# class SecondHabitatSimDepthSensor(habitat_simulator.HabitatSimDepthSensor):
+#     # Defines the name of the sensor in the sensor suite dictionary
+#     def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+#         return "depth2"
 
 
 if __name__ == "__main__":
