@@ -19,7 +19,7 @@ import tensorflow as tf
 import tqdm
 from utils.tfrecordfeatures import tf_bytelist_feature, tf_bytes_feature, tf_int64_feature
 
-from habitat_utils import get_all_floors_from_file, get_floor, encode_image_to_string, get_model_id_from_episode
+from habitat_utils import get_all_floors_from_file, get_floor, encode_image_to_string, get_model_id_from_episode, get_floor_from_json
 from lmap.utils.map.generator import HabitatMaps
 
 cv2 = try_cv2_import()
@@ -331,7 +331,7 @@ def generate_scenarios(output_filename=None, num_episodes=50000, skip_first_n=0,
         )
 
         if output_filename is None:
-            output_filename = './data/habscenarios_{}.tfrecords'.format(time.strftime('%m-%d-%H-%M-%S', time.localtime()))
+            output_filename = './temp/habscenarios_{}.tfrecords'.format(time.strftime('%m-%d-%H-%M-%S', time.localtime()))
         tfwriter = tf.python_io.TFRecordWriter(output_filename)
 
         episodes = []
@@ -353,10 +353,11 @@ def generate_scenarios(output_filename=None, num_episodes=50000, skip_first_n=0,
             ep = env.habitat_env.current_episode
             height = ep.start_position[1]
             sceen_id = get_model_id_from_episode(ep)
-            if sceen_id not in floors_for_scene.keys():
-                floors_for_scene[sceen_id] = get_all_floors_from_file(sceen_id)
-            floor = get_floor(height, floors_for_scene[sceen_id])
-            map_filename = './maps/%s_%d_map.png'%(sceen_id, floor)
+            # if sceen_id not in floors_for_scene.keys():
+            #     floors_for_scene[sceen_id] = get_all_floors_from_file(sceen_id)
+            # floor = get_floor(height, floors_for_scene[sceen_id])
+            # map_filename = './maps/%s_%d_map.png'%(sceen_id, floor)
+            floor = get_floor_from_json(sceen_id, height)
 
             actions = []
             rgbs = []
@@ -429,6 +430,13 @@ def generate_scenarios(output_filename=None, num_episodes=50000, skip_first_n=0,
                 #TODO not sure what interpolation is best,
                 # because depth has noise, nearest will be the worst;
                 # but averaging (invalid) zero with sth else is not good either
+
+                # Convert depth to uint8
+                assert depth.dtype == np.float32
+                depth = (depth * 255.).astype(np.uint8)
+
+                assert rgb.dtype == np.uint8
+                assert depth.dtype == np.uint8
 
                 actions.append(action)
                 rgbs.append(rgb)
@@ -535,12 +543,18 @@ def generate_scenarios(output_filename=None, num_episodes=50000, skip_first_n=0,
 def main(*args):
     parser = argparse.ArgumentParser()
     parser.add_argument("--maps", default="false", choices=["true", "false"],)
+    parser.add_argument("--mix_random", default="true", choices=["true", "false"],)
+    parser.add_argument("--spinning", default="false", choices=["true", "false"],)
     parser.add_argument("--map_method", default="mesh", choices=["mesh", "sampling", "hr_sampling"],)
     parser.add_argument("--num_episodes", type=int, default=0)
+    parser.add_argument("--skip_first_n", type=int, default=0)
     parser.add_argument("--split", default="val", type=str, choices=["train", "val"])
     parser.add_argument("--config", default="./configs/challenge_datagen.yaml", type=str)
+    parser.add_argument("--output", default=None, type=str)
     args = parser.parse_args()
     args.maps = (args.maps == "true")
+    args.mix_random = (args.mix_random == "true")
+    args.spinning = (args.spinning == "true")
 
     if args.maps:
         generate_maps(method=args.map_method, split=args.split)
@@ -549,17 +563,17 @@ def main(*args):
     # Figured from maps folder. Training set: 72 scenes. Val set: 14 scenes.
     split = args.split
     episodes_per_scene = 15
-    spinning = False
-    mix_random_policy = True
+    spinning = args.spinning
+    mix_random_policy = args.mix_random
 
     if split == 'train':
         # train
         num_episodes = 72 * episodes_per_scene * 1  # 72 training scenes. 200 per scene. Actually there are total 88, training less. Ended with Brevort.
-        skip_first_n = 3600 # 0  # 14400
+        # skip_first_n = 3600 # 0  # 14400
     elif split == 'val':
         # val
-        num_episodes = 15 * episodes_per_scene * 2  # 15 val scenes.
-        skip_first_n = 0
+        num_episodes = 14 * episodes_per_scene * 2  # 14 val scenes.
+        # skip_first_n = 0
     else:
         raise ValueError()
     num_episodes = num_episodes if args.num_episodes <= 0 else args.num_episodes
@@ -572,7 +586,12 @@ def main(*args):
         spin_every_forward_n = 10000
         spin_before_done = False
 
-    generate_scenarios(num_episodes=num_episodes, skip_first_n=skip_first_n,
+    output_filename = args.output
+    if output_filename is None or output_filename == '':
+        output_filename = './temp/habscenarios-%s.tfrecords.%d.%d'%(split, num_episodes, args.skip_first_n)
+
+    generate_scenarios(output_filename=output_filename,
+                       num_episodes=num_episodes, skip_first_n=args.skip_first_n,
                        spin_every_forward_n=spin_every_forward_n,
                        spin_before_done=spin_before_done,
                        mix_random_policy=mix_random_policy,

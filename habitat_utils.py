@@ -58,7 +58,7 @@ def encode_image_to_png(image):
 
 
 def encode_image_to_string(image):
-    return cv2.imencode(".png", image)[1].tostring()
+    return encode_image_to_png(image).tostring()
 
 
 def get_model_id_from_episode(ep):
